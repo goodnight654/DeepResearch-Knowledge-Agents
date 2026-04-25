@@ -1,4 +1,4 @@
-# 🤖 AgentKnowledgeHub — 企业级多Agent知识管理系统
+# 🤖 智能资料研究助手 — 本地知识库与联网深度研究
 
 <div align="center">
 
@@ -9,11 +9,11 @@
 ![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-FF6B6B)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
 
-**一个企业级的「多Agent协作」知识管理系统**
+**一个面向复杂问题的研究型智能体项目：本地知识库 + 联网搜索 + 证据引用 + 轨迹回放**
 
-4个AI Agent分工协作，完成企业知识的全生命周期管理：文档解析 → 知识抽取 → 智能问答 → 增量更新
+中文项目名是“智能资料研究助手”，英文代号是 DeepResearch Knowledge Hub。4 个基础智能体负责文档解析、知识抽取、智能问答和增量更新；深度研究智能体负责多轮规划、检索、网页阅读、证据归因与最终综合回答。
 
-[快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [API文档](#-api-接口) · [面试资料](#-面试资料)
+[快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [v2增强](#-v2-增强deepresearch--trace可视化) · [API文档](#-api-接口) · [面试资料](#-面试资料)
 
 </div>
 
@@ -44,6 +44,7 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 - 直接用自然语言提问："张三的职位是什么？" / "Q3营收多少？"
 - AI会综合理解文档内容，给出准确答案
 - 文档更新后，知识库自动同步，不用重新上传
+- 对复杂开放问题，可以走 DeepResearch：同时检索本地知识库和 Web Search，读取网页正文，最后输出带 `[E1]` 证据编号的综合结论
 
 ---
 
@@ -55,6 +56,7 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 - [三语言实现](#-三语言实现)
 - [快速开始](#-快速开始)
 - [功能演示](#-功能演示)
+- [v2增强（DeepResearch + Trace可视化）](#-v2-增强deepresearch--trace可视化)
 - [项目结构](#-项目结构)
 - [API接口](#-api-接口)
 - [面试资料](#-面试资料)
@@ -65,9 +67,9 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 
 ## 🎯 项目简介
 
-**AgentKnowledgeHub** 包含 **4个核心Agent**，通过 [LangGraph](https://langchain-ai.github.io/langgraph/) 有向图编排，实现企业知识的全链路智能处理。
+**智能资料研究助手** 是一个“本地知识库 + 联网研究”的智能体项目。系统通过流程编排框架管理多条工作流：普通问题走快速问答链路，复杂开放问题走深度研究链路，在每轮检索后判断信息缺口，并把最终结论绑定到证据来源。
 
-### 4个Agent是什么，分别做什么？
+### 基础 4 个 Agent 是什么，分别做什么？
 
 | Agent | 中文名 | 职责 | 类比理解 |
 |-------|--------|------|----------|
@@ -76,12 +78,15 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 | `QAAgent` | 问答Agent | 接收用户问题，同时查向量库和知识图谱，生成精准答案 | 专家顾问，综合多源信息回答 |
 | `KnowledgeUpdateAgent` | 知识更新Agent | 监听文档变更，只更新变化的部分，保持知识库最新 | 勤快管理员，实时维护知识库 |
 
-### 三大技术亮点
+> 核心增强：`DeepResearchAgent`，用于复杂问题的研究式多轮检索（`plan → retrieve → summarize → gap → synthesize`），可同时调用本地向量库、知识图谱和 Web Search，并读取网页正文形成证据表。
+
+### 四大技术亮点
 
 | 亮点 | 说明 | 解决什么问题 |
 |------|------|-------------|
 | **多模态RAG** | 不只处理文字，还能理解PDF里的图片、表格、流程图 | 传统系统只能处理纯文字 |
 | **GraphRAG (知识图谱)** | 用图数据库存储实体关系，支持多跳推理 | 纯向量检索无法处理"关系型"和"多步推理"问题 |
+| **DeepResearch** | 多轮规划、检索、网页阅读、gap analysis 和证据归因 | 单轮QA难以处理开放研究型问题 |
 | **CDC增量更新** | 文档变了只更新变化的部分 | 传统方案每次全量重建，1000个文档改5个要30分钟 |
 
 ---
@@ -272,6 +277,13 @@ cp .env.example .env
 OPENAI_API_KEY=sk-你的APIKey
 OPENAI_BASE_URL=https://api.openai.com/v1  # 国内用户可替换为兼容接口地址
 
+# DeepResearch增强配置（可选）
+WEB_SEARCH_PROVIDER=duckduckgo  # duckduckgo / tavily / serpapi / disabled
+TAVILY_API_KEY=
+SERPAPI_API_KEY=
+WEB_PAGE_FETCH_ENABLED=true
+RUN_TRACE_DIR=./run_traces
+
 # 数据库配置（使用Docker默认值即可，不用改）
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
@@ -327,6 +339,17 @@ curl -X POST http://localhost:8080/api/ingest/upload \
 curl -X POST http://localhost:8080/api/qa/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "这个文档讲了什么？"}'
+
+# DeepResearch（复杂开放问题）
+curl -X POST http://localhost:8080/api/qa/deep-research \
+  -H "Content-Type: application/json" \
+  -d '{"question": "请从技术、组织和风险三个维度比较A和B方案"}'
+```
+
+然后在浏览器打开 Trace Viewer：
+
+```text
+http://localhost:8080/ui/trace
 ```
 
 ---
@@ -435,12 +458,91 @@ await update_agent.process_cdc_event(event={
 })
 ```
 
+### 功能5：DeepResearch 多轮研究式检索（新增）
+
+DeepResearch 适合复杂、开放、需要多次补证据的问题，不再是“一次检索一次回答”。
+
+```python
+# API: POST /api/qa/deep-research
+{
+  "question": "请比较A和B架构在成本、可扩展性和风险上的差异，并给出证据链"
+}
+```
+
+DeepResearch 在编排层走这条可循环工作流：
+
+```text
+plan_search -> retrieve_round -> summarize_round -> assess_gap
+                                         ^             |
+                                         |             v
+                                    (continue)     synthesize
+```
+
+每轮输出都会进入 trace，用于回放和调试。
+
+### 功能6：Trace 可视化页面（新增）
+
+访问：
+
+```text
+http://localhost:8080/ui/trace
+```
+
+页面能力：
+- 左侧：最近 QA/DeepResearch 运行列表
+- 右侧：事件时间轴（plan/retrieve/summarize/gap/synthesize）
+- 支持按 `workflow` 过滤、按 `run_id` 精确回放
+
+---
+
+## 🧪 v2 增强（DeepResearch + Trace可视化）
+
+这一节聚焦 Python 增强版新增点，作为旧版 README 的补充。
+
+### DeepResearch 设计为什么是多节点循环而不是单次调用？
+
+原因：
+- 复杂问题无法一次收集完整证据，需要“检索-总结-补缺口”循环
+- 多节点图更容易做可观测与调试（每轮都可复盘）
+- 每个阶段可单独演进（后续可插入 citation-check、answer-critic 节点）
+
+### 为什么要加 Web Search 且保持可配置？
+
+原因：
+- Demo 和面试场景需要默认具备外部研究能力，因此 `.env.example` 使用 `duckduckgo`
+- 企业内网和离线环境仍可切到 `disabled`，保证合规与可控
+- Web 结果质量波动大，应该作为“补证据通道”而非主通道
+
+当前支持：
+- `WEB_SEARCH_PROVIDER=duckduckgo|tavily|serpapi|disabled`
+- `WEB_PAGE_FETCH_ENABLED=true` 时会读取网页正文、清洗、分块，并作为 evidence context
+
+### 为什么要做 Run Trace 持久化？
+
+原因：
+- Agent 系统没有 trace 很难定位错误轮次
+- 面试演示中，单看答案不如“可回放的推理轨迹”有说服力
+- 便于后续做评测与回归测试
+
+核心新增接口：
+- `GET /api/qa/runs`：最近运行列表
+- `GET /api/qa/runs/{run_id}`：单次运行详情（含 trace）
+- `GET /ui/trace`：可视化页面
+
+### 运行要点（新增）
+
+1. 默认使用 `WEB_SEARCH_PROVIDER=duckduckgo` 展示联网 DeepResearch。  
+2. 如果在离线/内网环境演示，可切到 `WEB_SEARCH_PROVIDER=disabled`，只跑本地知识库链路。  
+3. 使用 `/api/qa/deep-research` 发起复杂问题，拿到 `run_id`。  
+4. 在 `/ui/trace` 用 `run_id` 回放整条执行轨迹。  
+5. 推荐把 `RUN_TRACE_DIR` 指到持久化目录，避免容器重启丢轨迹。  
+
 ---
 
 ## 📁 项目结构
 
 ```
-AgentKnowledgeHub/
+deepresearch-knowledge-hub/
 │
 ├── README.md                          ← 你正在看的这个文件
 ├── docker-compose.yml                 ← 一键启动所有依赖服务
@@ -449,25 +551,31 @@ AgentKnowledgeHub/
 │   ├── architecture.md                ← 架构设计详解（每个决策的理由）
 │   ├── interview-guide.md             ← 面试八股文 + STAR法则话术
 │   ├── resume-template.md             ← 简历写法模板
+│   ├── resume-deepresearch-v2.md        ← DeepResearch增强简历模板（新增）
 │   ├── tech-deep-dive.md              ← 核心代码逐行讲解
 │   └── project-plan.md               ← 项目规划方案
 │
 ├── python/                            ← Python实现（功能最完整，推荐）
-│   ├── agents/                        ← 4个核心Agent
+│   ├── agents/                        ← 4个核心Agent + DeepResearch增强
 │   │   ├── doc_parser_agent.py        ← 文档解析Agent
+│   │   ├── deepresearch_agent.py        ← DeepResearch多轮研究式检索Agent（新增）
 │   │   ├── knowledge_extract_agent.py ← 知识抽取Agent
 │   │   ├── qa_agent.py                ← 问答Agent
 │   │   └── knowledge_update_agent.py  ← 知识更新Agent
 │   ├── orchestrator/
-│   │   └── graph.py                   ← LangGraph编排引擎（定义3条流水线）
+│   │   └── graph.py                   ← LangGraph编排引擎（DeepResearch多节点循环）
 │   ├── services/
+│   │   ├── hybrid_retriever.py        ← 统一混合检索层（vector+graph+web）（新增）
 │   │   ├── vector_store.py            ← 向量库服务（ChromaDB/PGVector）
 │   │   ├── knowledge_graph.py         ← 知识图谱服务（Neo4j）
 │   │   ├── graph_rag.py               ← GraphRAG混合检索管道
 │   │   ├── cdc_processor.py           ← CDC增量更新处理器
-│   │   └── multimodal.py              ← 多模态处理服务
+│   │   ├── multimodal.py              ← 多模态处理服务
+│   │   ├── web_search.py              ← 可配置联网搜索服务（新增）
+│   │   └── run_trace_store.py         ← 运行轨迹持久化服务（新增）
 │   ├── api/
-│   │   └── main.py                    ← FastAPI入口（REST API）
+│   │   ├── main.py                    ← FastAPI入口（新增run_id与trace接口）
+│   │   └── static/trace-viewer.html   ← Trace可视化前端页面（新增）
 │   ├── config/
 │   │   └── settings.py                ← 配置管理
 │   ├── Dockerfile                     ← Python服务容器化
@@ -527,10 +635,14 @@ AgentKnowledgeHub/
 | 方法 | 路径 | 说明 | 请求体示例 |
 |------|------|------|-----------|
 | `POST` | `/api/qa/ask` | 智能问答 | `{"question": "张三的职位？", "top_k": 5}` |
+| `POST` | `/api/qa/deep-research` | DeepResearch多轮研究检索 | `{"question": "比较A和B并给证据链"}` |
+| `GET` | `/api/qa/runs` | 最近运行记录列表 | `/api/qa/runs?limit=20&workflow=deepresearch` |
+| `GET` | `/api/qa/runs/{run_id}` | 运行详情（含trace事件） | `/api/qa/runs/deepresearch_xxx` |
 
 **响应示例：**
 ```json
 {
+  "run_id": "qa_20260424T010203Z_ab12cd34ef",
   "answer": "根据文档，张三担任腾讯公司CEO职务，负责微信产品线。",
   "confidence": 0.94,
   "sources": [
@@ -547,6 +659,7 @@ AgentKnowledgeHub/
 | `GET` | `/api/admin/stats` | 查看系统统计（文档数、实体数、关系数） |
 | `POST` | `/api/admin/update` | 手动触发全量更新 |
 | `GET` | `/api/health` | 健康检查 |
+| `GET` | `/ui/trace` | Trace可视化前端页面 |
 
 ---
 
@@ -559,6 +672,7 @@ AgentKnowledgeHub/
 | [**架构设计详解**](./docs/architecture.md) | 每个技术决策的理由（为什么用LangGraph？为什么用GraphRAG？） | 面试被深追问时 |
 | [**面试八股文+STAR**](./docs/interview-guide.md) | 30+高频面试题 + STAR话术模板 | 面试前1天突击 |
 | [**简历写法模板**](./docs/resume-template.md) | 怎么把这个项目写进简历（量化指标怎么写） | 投简历前 |
+| [**DeepResearch增强简历版**](./docs/resume-deepresearch-v2.md) | 包含DeepResearch/Web Search/Trace Viewer的新版简历 | 投递Agent岗位前 |
 | [**核心代码讲解**](./docs/tech-deep-dive.md) | 关键代码逐行解读，搞懂原理 | 代码层面被追问时 |
 | [**项目规划方案**](./docs/project-plan.md) | 完整的项目设计方案 | 理解整体思路 |
 
@@ -566,13 +680,14 @@ AgentKnowledgeHub/
 
 **S（背景）**: 企业内部文档知识管理效率低下，传统关键词搜索准确率只有60%，无法处理多格式文档和多跳推理问题。
 
-**T（任务）**: 设计并实现一个多Agent协作的企业知识管理系统，支持多模态文档处理和智能问答。
+**T（任务）**: 设计并实现一个智能资料研究助手，让系统既能查企业内部文档，也能在复杂问题上联网补充证据。
 
 **A（行动）**: 
-- 设计了4个专职Agent的分工协作架构
-- 引入GraphRAG融合向量检索和知识图谱检索
-- 实现了CDC增量更新机制，避免全量重建的性能损耗
-- 使用LangGraph有向图编排3条工作流水线
+- 设计“资料入库、知识提取、本地问答、增量更新”四个基础智能体，打通企业文档到问答的完整链路
+- 融合向量检索和知识图谱，让系统既能按语义查资料，也能处理实体关系和多跳推理问题
+- 增加复杂问题深度研究链路：自动拆题、多轮检索、阶段总结、缺口判断和最终综合
+- 支持联网搜索并读取网页正文，为关键结论生成证据编号，减少黑盒回答和模型编造风险
+- 新增运行轨迹保存和页面回放，支持按轮次调试和面试演示
 
 **R（结果）**: 
 - 问答准确率从60%提升到94%
@@ -640,6 +755,22 @@ Neo4j需要的内存比较多，建议给Docker分配至少4GB内存（Docker De
 - **Go版**：适合面基础架构/云原生/高性能后端岗位。
 
 根据你面试的岗位选择对应语言版本重点准备即可。
+
+### Q: 如何演示 DeepResearch 和 Trace Viewer 才更有说服力？
+
+推荐演示顺序：
+
+1. 先上传 1-2 份文档（有实体关系和对比信息）。
+2. 用 `/api/qa/deep-research` 提一个复杂问题（对比、评估、风险分析类）。
+3. 记录返回的 `run_id`。
+4. 打开 `/ui/trace`，按 `run_id` 回放并讲解每一轮：
+   - `plan_search`：问题拆解是否合理
+   - `retrieve_round`：每轮查询与召回条数
+   - `summarize_round`：阶段性结论
+   - `assess_gap`：为何继续下一轮或停止
+   - `synthesize`：最终整合回答
+
+这样能直观体现你不仅“有答案”，还“有可解释的执行过程”。
 
 ### Q: 如何运行测试？
 

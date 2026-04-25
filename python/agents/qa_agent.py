@@ -1,12 +1,13 @@
 """
-问答 Agent — 混合检索 (Vector + Graph) + 多跳推理 + 答案生成
+问答 Agent — 混合检索 + 答案生成
 
-核心能力:
-  1. 意图识别 & 查询改写
-  2. 向量检索 (语义相似度)
-  3. 图谱检索 (Cypher 查询 / 子图遍历)
-  4. 混合排序 & 重排序
-  5. 基于检索结果的答案生成（带引用来源）
+重构后职责:
+  1. 意图识别
+  2. 调用统一 HybridRetriever 检索上下文
+  3. 基于上下文生成最终答案
+
+说明:
+  QAAgent 聚焦“单轮问答”，更复杂的多轮研究编排由 DeepResearchAgent 负责。
 """
 
 from __future__ import annotations
@@ -19,23 +20,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from services.hybrid_retriever import HybridRetriever, RetrievedContext
 
 
 class QueryIntent(str, Enum):
-    FACTOID = "factoid"           # 事实型问题
-    ANALYTICAL = "analytical"     # 分析型问题
-    COMPARATIVE = "comparative"   # 对比型问题
-    PROCEDURAL = "procedural"     # 流程型问题
-    EXPLORATORY = "exploratory"   # 探索型问题
-
-
-@dataclass
-class RetrievedContext:
-    content: str
-    source: str
-    score: float
-    retrieval_type: str  # "vector" | "graph" | "hybrid"
-    metadata: dict[str, Any] = field(default_factory=dict)
+    FACTOID = "factoid"
+    ANALYTICAL = "analytical"
+    COMPARATIVE = "comparative"
+    PROCEDURAL = "procedural"
+    EXPLORATORY = "exploratory"
 
 
 @dataclass
@@ -57,26 +50,6 @@ INTENT_PROMPT = """\
 - exploratory: 探索型（有哪些/概述）
 """
 
-QUERY_REWRITE_PROMPT = """\
-你是一个查询改写专家。将用户问题改写为更适合检索的形式。
-要求：
-1. 提取核心实体和关键词
-2. 生成 1-3 个检索查询
-3. 返回 JSON: {"queries": ["查询1", "查询2"], "entities": ["实体1"], "keywords": ["关键词1"]}
-"""
-
-CYPHER_GENERATION_PROMPT = """\
-你是一个 Neo4j Cypher 查询生成专家。根据用户问题和提取的实体，生成 Cypher 查询。
-
-知识图谱 Schema:
-- 节点标签: Person, Organization, Technology, Product, Concept, Location
-- 关系类型: belongs_to, works_at, located_in, developed_by, related_to, part_of, uses, depends_on
-- 节点属性: name, type, description, created_at, version
-
-生成 1-2 条 Cypher 查询，返回 JSON: {"queries": ["MATCH ...", "MATCH ..."]}
-只返回 JSON，不要其他文字。
-"""
-
 ANSWER_PROMPT = """\
 你是一个专业的企业知识问答助手。根据检索到的上下文信息回答用户问题。
 
@@ -91,190 +64,103 @@ ANSWER_PROMPT = """\
 
 class QAAgent:
     """
-    问答 Agent
+    单轮问答 Agent
 
     工作流:
-      query → intent_classify → rewrite → parallel_retrieve → rerank → generate_answer
+      query → intent_classify → hybrid_retrieve → generate_answer
     """
 
     def __init__(
         self,
         vector_store: Any = None,
         knowledge_graph: Any = None,
+        web_search: Any = None,
+        web_page_reader: Any = None,
+        retriever: HybridRetriever | None = None,
+        llm: Any = None,
     ) -> None:
-        self.llm = ChatOpenAI(
+        self.llm = llm or ChatOpenAI(
             model=settings.openai_model,
             api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+            base_url=settings.openai_client_base_url,
             temperature=0,
         )
-        self.vector_store = vector_store
-        self.knowledge_graph = knowledge_graph
-
-    # ── public API ───────────────────────────────────────────
+        self.retriever = retriever or HybridRetriever(
+            vector_store=vector_store,
+            knowledge_graph=knowledge_graph,
+            web_search=web_search,
+            web_page_reader=web_page_reader,
+            llm=self.llm,
+        )
 
     async def answer(self, question: str) -> QAResult:
-        """完整问答流程"""
         intent = await self._classify_intent(question)
-        rewritten = await self._rewrite_query(question)
-
-        vector_contexts = await self._vector_retrieve(rewritten)
-        graph_contexts = await self._graph_retrieve(question, rewritten)
-
-        all_contexts = self._hybrid_rerank(vector_contexts + graph_contexts)
-        top_contexts = all_contexts[:8]
-
-        answer_text, reasoning = await self._generate_answer(question, top_contexts, intent)
+        analysis, contexts = await self.retriever.retrieve(
+            question,
+            top_k=settings.qa_context_limit,
+            per_query_limit=max(2, settings.qa_context_limit // 2),
+        )
+        answer_text, reasoning = await self._generate_answer(question, contexts, intent, analysis.queries)
 
         return QAResult(
             question=question,
             answer=answer_text,
-            contexts=top_contexts,
+            contexts=contexts,
             intent=intent,
-            confidence=self._calc_confidence(top_contexts),
+            confidence=self._calc_confidence(contexts),
             reasoning_steps=reasoning,
         )
-
-    # ── intent classification ────────────────────────────────
 
     async def _classify_intent(self, question: str) -> QueryIntent:
         messages = [
             SystemMessage(content=INTENT_PROMPT),
             HumanMessage(content=question),
         ]
-        resp = await self.llm.ainvoke(messages)
-        raw = resp.content.strip().lower()
+        try:
+            resp = await self.llm.ainvoke(messages)
+            raw = str(resp.content).strip().lower()
+        except Exception:
+            return QueryIntent.FACTOID
+
         for intent in QueryIntent:
             if intent.value in raw:
                 return intent
         return QueryIntent.FACTOID
-
-    # ── query rewriting ──────────────────────────────────────
-
-    async def _rewrite_query(self, question: str) -> dict:
-        import json
-        messages = [
-            SystemMessage(content=QUERY_REWRITE_PROMPT),
-            HumanMessage(content=question),
-        ]
-        resp = await self.llm.ainvoke(messages)
-        try:
-            cleaned = resp.content.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-            return json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError):
-            return {"queries": [question], "entities": [], "keywords": []}
-
-    # ── vector retrieval ─────────────────────────────────────
-
-    async def _vector_retrieve(self, rewritten: dict) -> list[RetrievedContext]:
-        if not self.vector_store:
-            return []
-
-        contexts: list[RetrievedContext] = []
-        for query in rewritten.get("queries", []):
-            results = await self.vector_store.search(query, top_k=5)
-            for doc, score in results:
-                contexts.append(RetrievedContext(
-                    content=doc.get("content", ""),
-                    source=doc.get("source", "vector_store"),
-                    score=score,
-                    retrieval_type="vector",
-                    metadata=doc.get("metadata", {}),
-                ))
-        return contexts
-
-    # ── graph retrieval ──────────────────────────────────────
-
-    async def _graph_retrieve(self, question: str, rewritten: dict) -> list[RetrievedContext]:
-        if not self.knowledge_graph:
-            return []
-
-        import json
-        entities = rewritten.get("entities", [])
-        messages = [
-            SystemMessage(content=CYPHER_GENERATION_PROMPT),
-            HumanMessage(content=f"问题: {question}\n实体: {entities}"),
-        ]
-        resp = await self.llm.ainvoke(messages)
-        try:
-            cleaned = resp.content.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-            cypher_data = json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError):
-            cypher_data = {"queries": []}
-
-        contexts: list[RetrievedContext] = []
-        for cypher in cypher_data.get("queries", []):
-            try:
-                records = await self.knowledge_graph.execute_cypher(cypher)
-                for record in records:
-                    contexts.append(RetrievedContext(
-                        content=str(record),
-                        source="knowledge_graph",
-                        score=0.8,
-                        retrieval_type="graph",
-                        metadata={"cypher": cypher},
-                    ))
-            except Exception:
-                continue
-        return contexts
-
-    # ── hybrid reranking ─────────────────────────────────────
-
-    @staticmethod
-    def _hybrid_rerank(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
-        """
-        混合重排序：向量分数 + 图谱分数加权
-        图谱检索结果天然带有结构化关系，给予略高权重
-        """
-        weight_map = {"vector": 1.0, "graph": 1.2, "hybrid": 1.1}
-        for ctx in contexts:
-            ctx.score *= weight_map.get(ctx.retrieval_type, 1.0)
-
-        seen: set[str] = set()
-        unique: list[RetrievedContext] = []
-        for ctx in contexts:
-            key = ctx.content[:100]
-            if key not in seen:
-                seen.add(key)
-                unique.append(ctx)
-
-        unique.sort(key=lambda c: c.score, reverse=True)
-        return unique
-
-    # ── answer generation ────────────────────────────────────
 
     async def _generate_answer(
         self,
         question: str,
         contexts: list[RetrievedContext],
         intent: QueryIntent,
+        queries: list[str],
     ) -> tuple[str, list[str]]:
         context_text = "\n\n".join(
-            f"[来源 {i+1}: {c.source} | 类型: {c.retrieval_type} | 分数: {c.score:.2f}]\n{c.content}"
-            for i, c in enumerate(contexts)
+            f"[来源 {i + 1}: {ctx.source} | 类型: {ctx.retrieval_type} | 分数: {ctx.score:.2f}]\n{ctx.content}"
+            for i, ctx in enumerate(contexts)
         )
         reasoning_steps = [
             f"识别问题意图: {intent.value}",
+            f"生成检索查询: {queries[:3]}",
             f"检索到 {len(contexts)} 条相关上下文",
-            f"向量检索: {sum(1 for c in contexts if c.retrieval_type == 'vector')} 条",
-            f"图谱检索: {sum(1 for c in contexts if c.retrieval_type == 'graph')} 条",
+            f"向量检索: {sum(1 for ctx in contexts if ctx.retrieval_type == 'vector')} 条",
+            f"图谱检索: {sum(1 for ctx in contexts if ctx.retrieval_type == 'graph')} 条",
         ]
 
         messages = [
             SystemMessage(content=ANSWER_PROMPT),
             HumanMessage(content=f"上下文信息:\n{context_text}\n\n用户问题: {question}"),
         ]
-        resp = await self.llm.ainvoke(messages)
+        try:
+            resp = await self.llm.ainvoke(messages)
+            answer = str(resp.content)
+        except Exception:
+            answer = "暂时无法生成答案，请检查模型或检索服务配置。"
         reasoning_steps.append("答案生成完成")
-        return resp.content, reasoning_steps
+        return answer, reasoning_steps
 
     @staticmethod
     def _calc_confidence(contexts: list[RetrievedContext]) -> float:
         if not contexts:
             return 0.0
-        avg_score = sum(c.score for c in contexts) / len(contexts)
+        avg_score = sum(ctx.score for ctx in contexts) / len(contexts)
         return min(avg_score, 1.0)

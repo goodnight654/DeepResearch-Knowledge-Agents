@@ -26,7 +26,7 @@ class VectorStoreService:
         self.embeddings = OpenAIEmbeddings(
             model=settings.embedding_model,
             api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+            base_url=settings.openai_client_base_url,
         )
         self._store: Any = None
         self._backend = settings.vector_store_type

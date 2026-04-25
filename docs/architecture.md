@@ -246,3 +246,91 @@ MODALITY_WEIGHTS = {
             │ 更新流水线 │ ← CDC事件 ← Kafka ← 文件系统/数据库变更
             └──────────┘
 ```
+
+---
+
+## 7. DeepResearch 增强架构（新增）
+
+### 为什么从“单轮QA”升级为“多轮DeepResearch”？
+
+单轮 QA 对事实型问题很好，但在以下场景会失效：
+- 问题开放且目标不明确（例如“请从技术、组织、风险三个维度比较方案A/B”）
+- 需要补证据才能形成结论
+- 需要跨文档、跨实体做多跳综合
+
+因此引入 DeepResearch 作为独立能力层，保留 QA 快路径。
+
+### DeepResearch 多节点编排
+
+```text
+plan_search -> retrieve_round -> summarize_round -> assess_gap
+                                         ^             |
+                                         |             v
+                                    (continue)     synthesize
+```
+
+每个节点职责：
+- `plan_search`：把用户问题拆成目标、子问题、初始查询
+- `retrieve_round`：按本轮焦点召回证据（向量 + 图谱 + 可选Web）
+- `summarize_round`：对当前证据做阶段性总结
+- `assess_gap`：判断是否“证据足够”，不足则产出 follow-up queries
+- `synthesize`：汇总多轮证据，输出最终回答与置信度
+
+### 为什么这样设计？
+
+1. **可控**：有明确终止条件（answered / max_iterations / no follow-up）  
+2. **可观测**：每轮状态都可单独回放和诊断  
+3. **可扩展**：后续插入“引用校验/答案审查”节点成本低  
+
+---
+
+## 8. Web Search 作为可选检索分支（新增）
+
+### 统一检索升级
+
+从：
+
+```text
+vector + graph
+```
+
+升级为：
+
+```text
+vector + graph + web -> unified rerank
+```
+
+### 为什么 Web Search 要可配置？
+
+1. Demo 和面试场景需要默认具备联网研究能力，当前默认 provider 是 `duckduckgo`  
+2. 生产环境常有内网或合规约束，因此必须支持切到 `disabled` 离线运行  
+3. 外部搜索质量波动大，应该作为补证据分支而不是主分支  
+4. 成本和稳定性可控：按 provider 开关，按需启用  
+
+支持 provider：
+- `duckduckgo`（默认）
+- `tavily`
+- `serpapi`
+- `disabled`
+
+---
+
+## 9. Run Trace 持久化与可视化（新增）
+
+### 设计目标
+
+Agent 系统的难点不是“跑起来”，而是“可解释、可回放、可复盘”。
+
+为此新增 `RunTraceStore`：
+- 每次 QA / DeepResearch 都落盘 JSON
+- 存储 `input / trace[] / output / status / error`
+- 通过 `run_id` 回放单次执行
+
+### Trace 前端页面
+
+新增 `/ui/trace`：
+- 左侧显示最近运行列表
+- 右侧显示事件时间轴
+- 支持按 `workflow` 过滤、按 `run_id` 精确回放
+
+这对面试演示非常关键：不仅有最终答案，还能展示“每轮为什么这么决策”。

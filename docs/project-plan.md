@@ -1,4 +1,4 @@
-# 多Agent企业知识管理系统 — 面试项目全套方案
+# 本地知识库与联网深度研究Agent — 面试项目全套方案
 
 > 本文档是项目的整体规划方案，记录了系统架构设计、技术选型、实施计划和面试资料框架。
 > 具体实现请参考各语言目录下的代码，详细面试资料参见本 docs/ 目录下的其他文档。
@@ -7,7 +7,7 @@
 
 ## 一、项目定位与架构设计
 
-本项目名为 **AgentKnowledgeHub**，是一个企业级多Agent知识管理系统，包含4个核心Agent协作完成知识全生命周期管理。
+本项目名为 **智能资料研究助手**（英文代号 DeepResearch Knowledge Hub），是一个本地知识库与联网深度研究系统，包含基础知识库链路和复杂问题深度研究链路。
 
 ### 系统架构（4 Agent 混合编排）
 
@@ -48,7 +48,7 @@ graph TD
 ## 二、项目目录结构
 
 ```
-AgentKnowledgeHub/
+deepresearch-knowledge-hub/
 ├── README.md                    # 超详细中文README（面向小白）
 ├── docs/
 │   ├── project-plan.md          # 本文件：项目规划方案
@@ -122,13 +122,14 @@ AgentKnowledgeHub/
 ### 4.1 简历模板（→ 详见 resume-template.md）
 
 ```
-项目名称：企业级多Agent知识管理系统
+项目名称：本地知识库与联网深度研究Agent
 项目角色：核心开发 / 独立开发
 技术栈：Python/LangGraph + Neo4j + PGVector + FastAPI + Docker
 项目描述：
-  - 设计并实现4-Agent混合编排架构，支持文档解析、知识抽取、智能问答、增量更新全流程
+  - 设计并实现本地知识库与联网深度研究 Agent，支持文档解析、知识抽取、智能问答、DeepResearch、增量更新全流程
   - 实现多模态RAG管道，支持PDF/图片/表格等混合文档解析，检索准确率提升35%
   - 基于Neo4j构建企业知识图谱，支持多跳推理，相比纯向量检索F1提升22%
+  - 构建 DeepResearch 多轮循环，融合本地知识库、Web Search、网页正文读取和 evidence-level citation
   - 设计CDC驱动的增量更新机制，知识库更新延迟从小时级降至分钟级
 ```
 
@@ -170,3 +171,62 @@ AgentKnowledgeHub/
 | Phase 3 | Java版（Spring AI + Spring Boot）+ Go版（Gin + go-openai） | 完成 |
 | Phase 4 | 详细README + 架构文档 + 面试八股文 + STAR话术 + 简历模板 + 代码讲解 | 完成 |
 | Phase 5 | Git初始化 + .gitignore + GitHub Actions CI + 推送到GitHub | 完成 |
+
+---
+
+## 六、V2 增强补充（DeepResearch + Trace 可视化）
+
+> 在原有 4-Agent 体系上，Python 增强版已新增以下模块，不影响原有流水线可用性。
+
+### 6.1 新增模块
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| DeepResearch Agent | `python/agents/deepresearch_agent.py` | 复杂问题的多轮研究式检索与综合 |
+| 混合检索底座 | `python/services/hybrid_retriever.py` | 统一 `vector + graph + web` 检索能力 |
+| Web Search 服务 | `python/services/web_search.py` | 可配置 provider 的外部检索补证据 |
+| Run Trace 存储 | `python/services/run_trace_store.py` | 持久化每次 run 的输入/轨迹/输出 |
+| Trace UI | `python/api/static/trace-viewer.html` | 前端按轮展示运行事件时间轴 |
+
+### 6.2 编排层升级
+
+DeepResearch 从单节点调用升级为多节点循环图：
+
+```text
+plan_search -> retrieve_round -> summarize_round -> assess_gap
+                                         ^             |
+                                         |             v
+                                    (continue)     synthesize
+```
+
+核心收益：
+- 节点级可观测（每轮可回放）
+- 节点级可优化（可独立替换策略）
+- 显式终止条件（避免无穷循环）
+
+### 6.3 API 增量
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/qa/deep-research` | DeepResearch 多轮问答 |
+| `GET` | `/api/qa/runs` | 最近运行列表 |
+| `GET` | `/api/qa/runs/{run_id}` | 单次运行详情（含trace） |
+| `GET` | `/ui/trace` | Trace 可视化页面 |
+
+### 6.4 新增运行配置
+
+```env
+WEB_SEARCH_PROVIDER=duckduckgo # duckduckgo / tavily / serpapi / disabled
+TAVILY_API_KEY=
+SERPAPI_API_KEY=
+WEB_SEARCH_TIMEOUT_SECONDS=10
+WEB_SEARCH_TOP_K=5
+WEB_PAGE_FETCH_ENABLED=true
+RUN_TRACE_DIR=./run_traces
+```
+
+### 6.5 面试表达建议（V2）
+
+新增这句话很加分：
+
+> “我把 DeepResearch 从脚本逻辑抽成了可循环的图编排，并给每次 run 做了可回放 trace，这让系统从‘能回答’升级到了‘可解释、可诊断、可评测’。”

@@ -300,10 +300,86 @@ func (a *DocParserAgent) ParseBatch(filePaths []string) ([]DocumentChunk, error)
 
 ---
 
-## 总结: 面试中如何展示技术深度
+## 8. DeepResearch 多节点循环编排（新增）
 
-1. **能画架构图**: 白板上画出4Agent+3流水线的架构
-2. **能讲设计决策**: 每个技术选型都有理由
-3. **能写关键代码**: Cypher查询、LangGraph编排、CDC差量计算
-4. **能说优化思路**: 知道当前方案的不足和改进方向
-5. **能做技术对比**: LangGraph vs CrewAI，ChromaDB vs Milvus
+原先 DeepResearch 是单次函数调用，不利于观测和调试。  
+现在在 `orchestrator/graph.py` 中拆成 5 个节点：
+
+```python
+graph.add_node("plan_search", plan_search)
+graph.add_node("retrieve_round", retrieve_round)
+graph.add_node("summarize_round", summarize_round)
+graph.add_node("assess_gap", assess_gap)
+graph.add_node("synthesize", synthesize)
+
+graph.add_conditional_edges(
+    "assess_gap",
+    route_after_gap,
+    {"retrieve": "retrieve_round", "synthesize": "synthesize"},
+)
+```
+
+关键点：
+- `assess_gap` 是闭环核心：决定“继续检索还是收敛”
+- `should_finalize` 统一终止条件（answered / max_iterations / 无follow-up）
+- 每个节点都输出 trace event，保证可回放
+
+---
+
+## 9. Web Search 可插拔检索分支（新增）
+
+`HybridRetriever` 新增 `web_search` 注入，形成统一召回：
+
+```python
+vector_contexts = await self._vector_retrieve(...)
+graph_contexts = await self._graph_retrieve(...)
+web_contexts = await self._web_retrieve(...)
+contexts = self._hybrid_rerank(vector_contexts + graph_contexts + web_contexts)
+```
+
+设计细节：
+- provider 可配置：`duckduckgo / tavily / serpapi / disabled`
+- 默认 `duckduckgo`，便于面试演示联网研究；内网或离线环境可切到 `disabled`
+- Web snippet 权重设为 `1.05`，网页正文 `web_page` 权重设为 `1.15`，避免外部噪音主导答案
+
+---
+
+## 10. Run Trace 存储与前端可视化（新增）
+
+### 后端落盘
+
+`RunTraceStore` 将 run 保存为 JSON：
+
+```python
+record = {
+    "run_id": run_id,
+    "workflow": workflow,
+    "input": input_payload,
+    "trace": trace,
+    "output": output,
+    "status": status,
+}
+```
+
+并提供：
+- `load_run(run_id)`：读取单次运行
+- `list_runs(limit, workflow)`：分页/过滤最近运行
+
+### 前端页面
+
+新增 `/ui/trace` 页面：
+- 左侧展示 runs 列表
+- 右侧展示事件时间轴（plan/retrieve/summarize/gap/synthesize）
+- 支持 URL 参数 `?run_id=...` 直接回放
+
+这部分在面试中是亮点：你可以演示“Agent 如何做决策”，而不是只展示最终答案。
+
+---
+
+## 总结: 面试中如何展示技术深度（V2）
+
+1. **能画架构图**: 4-Agent 主链路 + DeepResearch 多节点循环图  
+2. **能讲设计决策**: 为什么 DeepResearch 要拆节点、为什么 Web Search 要可配置  
+3. **能写关键代码**: LangGraph 条件边、HybridRetriever 融合检索、RunTraceStore  
+4. **能做可视化演示**: `/ui/trace` 按轮回放，解释每轮为何继续/停止  
+5. **能说演进路线**: citation-check、自动评测、在线A/B、成本优化  

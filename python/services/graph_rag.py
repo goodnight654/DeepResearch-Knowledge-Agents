@@ -72,7 +72,7 @@ class GraphRAGPipeline:
         self.llm = ChatOpenAI(
             model=settings.openai_model,
             api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+            base_url=settings.openai_client_base_url,
             temperature=0,
         )
 
