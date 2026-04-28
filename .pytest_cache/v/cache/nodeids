@@ -1,0 +1,12 @@
+[
+  "python/tests/test_deepresearch_flow_api.py::test_deepresearch_graph_runs_multiple_rounds_and_synthesizes_evidence",
+  "python/tests/test_deepresearch_flow_api.py::test_deepresearch_api_new_and_legacy_routes_return_run_id_and_list_runs",
+  "python/tests/test_deepresearch_web_reader.py::test_web_page_reader_extracts_visible_text",
+  "python/tests/test_deepresearch_web_reader.py::test_hybrid_retriever_prefers_page_chunks_over_snippets",
+  "python/tests/test_deepsearch_refactor.py::test_hybrid_rerank_prefers_high_score_and_dedupes",
+  "python/tests/test_deepsearch_refactor.py::test_clean_list_removes_empty_and_duplicates",
+  "python/tests/test_deepsearch_refactor.py::test_build_evidence_assigns_stable_ids_and_sources",
+  "python/tests/test_run_trace_store.py::test_save_load_and_list_runs",
+  "python/tests/test_settings.py::test_normalize_openai_base_url_accepts_chat_endpoint",
+  "python/tests/test_settings.py::test_settings_exposes_client_base_url"
+]

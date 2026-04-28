@@ -2,18 +2,18 @@
 
 <div align="center">
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python)
 ![Java](https://img.shields.io/badge/Java-17%2B-007396?logo=java)
 ![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go)
 ![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-FF6B6B)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
+![Maintainer](https://img.shields.io/badge/Maintainer-goodnight654-2E7D32)
 
 **一个面向复杂问题的研究型智能体项目：本地知识库 + 联网搜索 + 证据引用 + 轨迹回放**
 
 中文项目名是“智能资料研究助手”，英文代号是 DeepResearch Knowledge Hub。4 个基础智能体负责文档解析、知识抽取、智能问答和增量更新；深度研究智能体负责多轮规划、检索、网页阅读、证据归因与最终综合回答。
 
-[快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [v2增强](#-v2-增强deepresearch--trace可视化) · [API文档](#-api-接口) · [面试资料](#-面试资料)
+[GitHub 仓库](https://github.com/goodnight654/DeepResearch-Knowledge-Agents) · [快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [v2增强](#-v2-增强deepresearch--trace可视化) · [API文档](#-api-接口) · [面试资料](#-面试资料)
 
 </div>
 
@@ -53,7 +53,7 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 - [项目简介](#-项目简介)
 - [系统架构](#-系统架构)
 - [技术栈](#-技术栈)
-- [三语言实现](#-三语言实现)
+- [当前实现与规划](#-当前实现与规划)
 - [快速开始](#-快速开始)
 - [功能演示](#-功能演示)
 - [v2增强（DeepResearch + Trace可视化）](#-v2-增强deepresearch--trace可视化)
@@ -62,12 +62,13 @@ Agent（智能体）就是一个"能思考、能执行"的AI程序。它可以�
 - [面试资料](#-面试资料)
 - [常见问题](#-常见问题-faq)
 - [参考资料](#-参考资料)
+- [来源与合规说明](#-来源与合规说明)
 
 ---
 
 ## 🎯 项目简介
 
-**智能资料研究助手** 是一个“本地知识库 + 联网研究”的智能体项目。系统通过流程编排框架管理多条工作流：普通问题走快速问答链路，复杂开放问题走深度研究链路，在每轮检索后判断信息缺口，并把最终结论绑定到证据来源。
+**智能资料研究助手** 是由 [goodnight654](https://github.com/goodnight654) 维护的“本地知识库 + 联网研究”智能体项目。系统通过流程编排框架管理多条工作流：普通问题走快速问答链路，复杂开放问题走深度研究链路，在每轮检索后判断信息缺口，并把最终结论绑定到证据来源。
 
 ### 基础 4 个 Agent 是什么，分别做什么？
 
@@ -212,38 +213,19 @@ CDC事件产生（通过Kafka或文件监听）
 | **消息队列** | [Apache Kafka](https://kafka.apache.org/) | CDC事件流处理的工业标准 |
 | **API框架** | [FastAPI](https://fastapi.tiangolo.com/) | 异步高性能，自动生成OpenAPI/Swagger文档 |
 | **文档解析** | [Unstructured](https://unstructured.io/) + PyPDF2 + Tesseract | 多模态文档解析全家桶 |
-| **容器化** | [Docker Compose](https://docs.docker.com/compose/) | 一键启动所有依赖服务 |
-
-### Java版
-
-| 组件 | 技术选型 | 说明 |
-|------|----------|------|
-| **框架** | [Spring Boot 3.4](https://spring.io/projects/spring-boot) + [Spring AI](https://spring.io/projects/spring-ai) | Java生态最成熟的AI应用框架 |
-| **文档解析** | [Apache Tika](https://tika.apache.org/) | Java文档解析标准库，支持1000+格式 |
-| **向量存储** | [Milvus](https://milvus.io/) | 企业级向量数据库 |
-| **消息队列** | [Spring Kafka](https://spring.io/projects/spring-kafka) | @KafkaListener注解驱动，开发效率高 |
-
-### Go版
-
-| 组件 | 技术选型 | 说明 |
-|------|----------|------|
-| **API框架** | [Gin](https://gin-gonic.com/) | Go生态最流行的HTTP框架，极低延迟 |
-| **LLM调用** | [go-openai](https://github.com/sashabaranov/go-openai) | OpenAI官方Go SDK |
-| **图数据库** | [neo4j-go-driver](https://github.com/neo4j/neo4j-go-driver) | Neo4j官方Go驱动 |
-| **向量存储** | [pgvector-go](https://github.com/pgvector/pgvector-go) | PostgreSQL向量扩展Go客户端 |
-| **并发** | goroutine | Go原生并发，文档批量解析天然并行 |
+| **容器化** | [Docker](https://docs.docker.com/) | 当前提供 Python 服务 Dockerfile，依赖服务按部署环境单独配置 |
 
 ---
 
-## 🌐 三语言实现
+## 🌐 当前实现与规划
 
-本项目同时提供 Python、Java、Go 三种语言实现，**架构设计完全一致**，只是语言和框架不同。
+当前仓库以 Python 实现为主，`docs/` 中保留了架构设计、面试材料和后续扩展规划。Java / Go 版本适合作为后续按同一架构迁移的方向，目前不在本仓库提交目录中。
 
-| 语言 | 适合什么岗位 | 特点 | 目录 |
+| 模块 | 状态 | 说明 | 目录 |
 |------|------------|------|------|
-| **Python** | AI工程师、算法工程师、数据工程师 | 功能最完整，LangGraph原生支持，推荐学习入口 | [`python/`](./python/) |
-| **Java** | 后端开发、架构师、Java技术栈企业 | Spring生态，企业级标准，代码规范严谨 | [`java/`](./java/) |
-| **Go** | 基础架构、云原生、高性能后端 | 高并发处理，编译型语言性能优势明显 | [`golang/`](./golang/) |
+| **Python API + Agent 工作流** | 已实现 | LangGraph 编排、FastAPI 接口、DeepResearch、Trace Viewer | [`python/`](./python/) |
+| **架构与面试文档** | 已实现 | 架构说明、项目规划、简历模板、技术讲解 | [`docs/`](./docs/) |
+| **Java / Go 迁移版** | 规划中 | 可按 `docs/project-plan.md` 的模块边界继续扩展 | [`docs/project-plan.md`](./docs/project-plan.md) |
 
 ---
 
@@ -253,14 +235,15 @@ CDC事件产生（通过Kafka或文件监听）
 
 在开始之前，你需要安装：
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)（用于一键启动依赖服务）
+- Python 3.10+
 - 一个 OpenAI API Key（或者用国内兼容接口，见下方FAQ）
+- 可选：Neo4j、ChromaDB/PGVector、Kafka。只演示 API 文档、Trace 页面或联网 DeepResearch 时，可以先不启动这些本地依赖；上传文档、向量入库、知识图谱和 CDC 相关能力需要对应服务可用。
 
 ### 步骤1：克隆项目
 
 ```bash
-git clone https://github.com/bcefghj/agent-knowledge-hub.git
-cd agent-knowledge-hub
+git clone https://github.com/goodnight654/DeepResearch-Knowledge-Agents.git
+cd DeepResearch-Knowledge-Agents
 ```
 
 ### 步骤2：配置环境变量
@@ -284,7 +267,7 @@ SERPAPI_API_KEY=
 WEB_PAGE_FETCH_ENABLED=true
 RUN_TRACE_DIR=./run_traces
 
-# 数据库配置（使用Docker默认值即可，不用改）
+# 本地依赖服务配置（按你的实际部署修改）
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
@@ -293,29 +276,17 @@ CHROMA_PORT=8000
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 ```
 
-### 步骤3：一键启动所有服务
+### 步骤3：安装依赖
 
 ```bash
-# 回到项目根目录
-cd ..
-
-# 启动所有依赖（Neo4j、ChromaDB、Kafka）
-docker-compose up -d
-```
-
-等待约1分钟，然后检查服务状态：
-
-```bash
-docker-compose ps
-```
-
-你应该看到所有服务状态为 `Up`。
-
-### 步骤4：启动Python API服务
-
-```bash
-cd python
 pip install -r requirements.txt
+```
+
+如果你要演示完整的文档入库、GraphRAG 或 CDC 流程，请先按 `.env` 中的地址启动 Neo4j、ChromaDB/PGVector 和 Kafka。当前仓库提供 `python/Dockerfile`，但没有提交根目录 `docker-compose.yml`。
+
+### 步骤4：启动 Python API 服务
+
+```bash
 python -m api.main
 ```
 
@@ -542,10 +513,9 @@ http://localhost:8080/ui/trace
 ## 📁 项目结构
 
 ```
-deepresearch-knowledge-hub/
+DeepResearch-Knowledge-Agents/
 │
 ├── README.md                          ← 你正在看的这个文件
-├── docker-compose.yml                 ← 一键启动所有依赖服务
 │
 ├── docs/                              ← 文档目录
 │   ├── architecture.md                ← 架构设计详解（每个决策的理由）
@@ -581,40 +551,6 @@ deepresearch-knowledge-hub/
 │   ├── Dockerfile                     ← Python服务容器化
 │   ├── requirements.txt               ← Python依赖
 │   └── .env.example                   ← 环境变量模板（复制为.env后填写）
-│
-├── java/                              ← Java实现（Spring生态）
-│   ├── src/main/java/com/agenthub/
-│   │   ├── agent/                     ← 4个Agent（Spring Bean）
-│   │   │   ├── DocParserAgent.java
-│   │   │   ├── KnowledgeExtractAgent.java
-│   │   │   ├── QAAgent.java
-│   │   │   └── KnowledgeUpdateAgent.java
-│   │   ├── service/                   ← 服务层
-│   │   │   ├── VectorStoreService.java
-│   │   │   └── KnowledgeGraphService.java
-│   │   ├── controller/                ← REST Controller
-│   │   │   └── KnowledgeController.java
-│   │   └── model/                     ← 数据模型（POJO）
-│   ├── src/main/resources/
-│   │   └── application.yml            ← Spring Boot配置
-│   └── pom.xml                        ← Maven依赖管理
-│
-└── golang/                            ← Go实现（高并发）
-    ├── agent/                         ← Agent实现
-    │   ├── doc_parser.go
-    │   ├── knowledge_extract.go
-    │   └── qa.go
-    ├── service/                       ← 服务层
-    │   ├── vector_store.go
-    │   └── knowledge_graph.go
-    ├── api/
-    │   └── server.go                  ← Gin HTTP服务器
-    ├── model/
-    │   └── types.go                   ← 数据结构定义
-    ├── config/
-    │   └── config.go                  ← 配置读取
-    ├── main.go                        ← 程序入口
-    └── go.mod                         ← Go模块依赖
 ```
 
 ---
@@ -720,21 +656,17 @@ OPENAI_API_KEY=ollama
 OPENAI_MODEL=qwen2
 ```
 
-### Q: Docker启动后服务报错？
+### Q: 本地依赖服务连接失败怎么办？
 
 ```bash
-# 查看所有服务状态
-docker-compose ps
+# 检查 API 服务是否启动
+curl http://localhost:8080/api/health
 
-# 查看某个服务的日志
-docker-compose logs neo4j
-docker-compose logs kafka
-
-# 重启某个服务
-docker-compose restart neo4j
+# 检查 .env 中的地址是否与本地服务一致
+cat .env | grep -E "NEO4J|CHROMA|PGVECTOR|KAFKA"
 ```
 
-Neo4j需要的内存比较多，建议给Docker分配至少4GB内存（Docker Desktop → Settings → Resources → Memory）。
+Neo4j、ChromaDB/PGVector 和 Kafka 需要单独启动。Neo4j 需要的内存比较多，如果使用 Docker Desktop，建议至少分配 4GB 内存。
 
 ### Q: 这个项目可以直接用在公司生产环境吗？
 
@@ -746,15 +678,13 @@ Neo4j需要的内存比较多，建议给Docker分配至少4GB内存（Docker De
 - 全面的单元测试和集成测试
 - 生产级的数据备份方案
 
-### Q: Python / Java / Go 三个版本有什么区别，用哪个？
+### Q: Python / Java / Go 三个版本有什么区别？
 
-**三个版本架构设计完全一致**，只是实现语言不同：
+当前仓库提交的是 Python 版实现。Java / Go 可以作为后续扩展方向：
 
-- **Python版**：功能最完整，推荐作为学习入口。面AI工程师/算法工程师岗位必备。
-- **Java版**：用Spring生态实现，适合面Java后端/架构师岗位。
-- **Go版**：适合面基础架构/云原生/高性能后端岗位。
-
-根据你面试的岗位选择对应语言版本重点准备即可。
+- **Python版**：当前主实现，适合 AI 工程师、算法工程师、数据工程师方向。
+- **Java版规划**：可用 Spring Boot / Spring AI 复刻 API 与服务层，适合 Java 后端方向。
+- **Go版规划**：可用 Gin + Neo4j Go Driver + pgvector 客户端实现高并发服务，适合云原生方向。
 
 ### Q: 如何演示 DeepResearch 和 Trace Viewer 才更有说服力？
 
@@ -778,14 +708,6 @@ Neo4j需要的内存比较多，建议给Docker分配至少4GB内存（Docker De
 # Python
 cd python
 pytest tests/
-
-# Java
-cd java
-mvn test
-
-# Go
-cd golang
-go test ./...
 ```
 
 ---
@@ -819,10 +741,16 @@ go test ./...
 
 欢迎提 Issue 和 PR！
 
-- 发现 Bug？[提交 Issue](https://github.com/bcefghj/agent-knowledge-hub/issues)
+- 发现 Bug？[提交 Issue](https://github.com/goodnight654/DeepResearch-Knowledge-Agents/issues)
 - 想加新功能？欢迎 Fork 后提 PR
 - 觉得有帮助？请点个 ⭐ Star，这是对我最大的鼓励！
 
+## 🧾 来源与合规说明
+
+本仓库由 [goodnight654](https://github.com/goodnight654) 维护，当前文档、部署说明和 DeepResearch/Trace Viewer 等增强能力围绕本仓库持续整理和演进。
+
+如果本项目基于其他开源项目或早期版本继续开发，公开发布和分发时应保留原项目许可证、版权声明和必要致谢，并在后续补充完整的 `LICENSE` / `NOTICE` 文件。
+
 ## 📄 License
 
-[MIT License](./LICENSE) — 可以自由使用、修改、分发，只需保留原始版权声明。
+当前仓库还没有提交独立的许可证文件。若计划对外分发或用于商业场景，建议先补充与上游许可兼容的 `LICENSE` 文件。
