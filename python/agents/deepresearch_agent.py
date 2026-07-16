@@ -1,7 +1,7 @@
-"""Canonical DeepResearch agent exports.
+"""Canonical DeepResearch public imports.
 
-The old `deepsearch_agent` module remains as a compatibility layer because the
-project previously exposed `/deep-search` and `DeepSearchAgent`.
+The implementation stays in ``deepsearch_agent`` so existing import paths keep
+working; new callers should import the DeepResearch names from this module.
 """
 
 from agents.deepsearch_agent import (

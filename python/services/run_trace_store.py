@@ -47,7 +47,12 @@ class RunTraceStore:
             "error": error,
         }
         file_path = self.base_dir / f"{run_id}.json"
-        file_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = self.base_dir / f".{run_id}.{uuid4().hex}.tmp"
+        try:
+            temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(file_path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return run_id
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
@@ -67,7 +72,7 @@ class RunTraceStore:
         limit: int = 20,
         workflow: str | None = None,
     ) -> list[dict[str, Any]]:
-        max_items = max(1, limit)
+        max_items = min(max(1, int(limit)), 200)
         files = sorted(
             self.base_dir.glob("*.json"),
             key=lambda path: path.stat().st_mtime,

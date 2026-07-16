@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import time
 from typing import Any
 
@@ -23,16 +25,37 @@ class KnowledgeGraphService:
 
     def __init__(self) -> None:
         self._driver: Any = None
+        self._initialization_error = ""
+
+    @property
+    def available(self) -> bool:
+        return self._driver is not None
 
     # ── lifecycle ────────────────────────────────────────────
 
     async def init(self) -> None:
         from neo4j import AsyncGraphDatabase
-        self._driver = AsyncGraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_user, settings.neo4j_password),
-        )
-        await self._ensure_indexes()
+
+        try:
+            self._driver = AsyncGraphDatabase.driver(
+                settings.neo4j_uri,
+                auth=(settings.neo4j_user, settings.neo4j_password),
+            )
+            await self._driver.verify_connectivity()
+            await self._ensure_indexes()
+            self._initialization_error = ""
+        except asyncio.CancelledError:
+            if self._driver:
+                await self._driver.close()
+            self._driver = None
+            self._initialization_error = "initialization timed out"
+            raise
+        except Exception as exc:
+            if self._driver:
+                await self._driver.close()
+            self._driver = None
+            self._initialization_error = str(exc)
+            raise
 
     async def close(self) -> None:
         if self._driver:
@@ -71,18 +94,21 @@ class KnowledgeGraphService:
             e.updated_at = $now
         """
         async with self._driver.session() as session:
-            await session.run(cypher, {
-                "name": entity.name,
-                "type": entity.type,
-                "description": entity.description,
-                "version": version,
-                "source": source,
-                "now": int(time.time()),
-            })
+            await session.run(
+                cypher,
+                {
+                    "name": entity.name,
+                    "type": entity.type,
+                    "description": entity.description,
+                    "version": version,
+                    "source": source,
+                    "now": int(time.time()),
+                },
+            )
 
     async def add_relation(self, relation: Relation, source: str = "") -> None:
         """创建实体间关系"""
-        rel_type = relation.relation.upper().replace(" ", "_")
+        rel_type = self._sanitize_relation_type(relation.relation)
         cypher = f"""
         MATCH (h:Entity {{name: $head}})
         MATCH (t:Entity {{name: $tail}})
@@ -90,18 +116,29 @@ class KnowledgeGraphService:
         SET r.confidence = $confidence, r.source = $source, r.updated_at = $now
         """
         async with self._driver.session() as session:
-            await session.run(cypher, {
-                "head": relation.head,
-                "tail": relation.tail,
-                "confidence": relation.confidence,
-                "source": source,
-                "now": int(time.time()),
-            })
+            await session.run(
+                cypher,
+                {
+                    "head": relation.head,
+                    "tail": relation.tail,
+                    "confidence": relation.confidence,
+                    "source": source,
+                    "now": int(time.time()),
+                },
+            )
+
+    @staticmethod
+    def _sanitize_relation_type(value: str) -> str:
+        rel_type = re.sub(r"[^A-Z0-9_]", "_", str(value).upper().replace(" ", "_"))
+        rel_type = re.sub(r"_+", "_", rel_type).strip("_") or "RELATED_TO"
+        return f"REL_{rel_type}" if rel_type[0].isdigit() else rel_type
 
     # ── query operations ─────────────────────────────────────
 
     async def execute_cypher(self, cypher: str, params: dict | None = None) -> list[dict]:
         """执行任意 Cypher 查询"""
+        if not self.available:
+            return []
         async with self._driver.session() as session:
             result = await session.run(cypher, params or {})
             records = await result.data()
@@ -118,8 +155,9 @@ class KnowledgeGraphService:
         多跳子图检索 — GraphRAG 的核心能力
         从指定实体出发，遍历 N 跳内的所有关联实体和关系
         """
+        safe_hops = max(1, min(int(hops), 5))
         cypher = f"""
-        MATCH path = (start:Entity {{name: $name}})-[*1..{hops}]-(neighbor)
+        MATCH path = (start:Entity {{name: $name}})-[*1..{safe_hops}]-(neighbor)
         RETURN
             start.name AS source,
             [r IN relationships(path) | type(r)] AS relations,
@@ -156,9 +194,17 @@ class KnowledgeGraphService:
 
     async def get_stats(self) -> dict:
         """获取图谱统计信息"""
+        if not self.available:
+            return {
+                "available": False,
+                "total_entities": 0,
+                "total_relations": 0,
+                "error": self._initialization_error,
+            }
         entity_count = await self.execute_cypher("MATCH (e:Entity) RETURN count(e) AS cnt")
         rel_count = await self.execute_cypher("MATCH ()-[r]->() RETURN count(r) AS cnt")
         return {
+            "available": True,
             "total_entities": entity_count[0]["cnt"] if entity_count else 0,
             "total_relations": rel_count[0]["cnt"] if rel_count else 0,
         }

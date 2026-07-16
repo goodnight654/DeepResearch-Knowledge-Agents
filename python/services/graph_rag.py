@@ -17,16 +17,16 @@ GraphRAG 混合检索管道 — 向量检索 + 图谱遍历 + 重排序
 
 from __future__ import annotations
 
-import json
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from config import settings
 from services.knowledge_graph import KnowledgeGraphService
 from services.vector_store import VectorStoreService
+from utils.json_utils import coerce_float, parse_json_object
+from utils.openai_clients import create_chat_model
 
 
 @dataclass
@@ -66,25 +66,35 @@ class GraphRAGPipeline:
         self,
         vector_store: VectorStoreService,
         knowledge_graph: KnowledgeGraphService,
+        llm: Any = None,
     ) -> None:
         self.vector_store = vector_store
         self.knowledge_graph = knowledge_graph
-        self.llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+        self.llm = llm or create_chat_model()
 
     async def retrieve(self, query: str, top_k: int = 10) -> list[GraphRAGContext]:
         """
         混合检索入口
         并行执行向量检索和图谱检索，然后交叉重排序
         """
-        vector_results = await self._vector_search(query, top_k=top_k)
-        entities = await self._entity_linking(query)
-        subgraph_results = await self._subgraph_search(entities)
-        path_results = await self._path_search(entities)
+        query = " ".join(query.split()).strip()
+        if not query:
+            return []
+        top_k = max(1, min(int(top_k), 100))
+        vector_result, entity_result = await asyncio.gather(
+            self._vector_search(query, top_k=top_k),
+            self._entity_linking(query),
+            return_exceptions=True,
+        )
+        vector_results = [] if isinstance(vector_result, Exception) else vector_result
+        entities = [] if isinstance(entity_result, Exception) else entity_result
+        subgraph_result, path_result = await asyncio.gather(
+            self._subgraph_search(entities),
+            self._path_search(entities),
+            return_exceptions=True,
+        )
+        subgraph_results = [] if isinstance(subgraph_result, Exception) else subgraph_result
+        path_results = [] if isinstance(path_result, Exception) else path_result
 
         all_results = vector_results + subgraph_results + path_results
 
@@ -116,23 +126,28 @@ class GraphRAGPipeline:
             SystemMessage(content=ENTITY_LINKING_PROMPT),
             HumanMessage(content=query),
         ]
-        resp = await self.llm.ainvoke(messages)
         try:
-            cleaned = resp.content.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-            data = json.loads(cleaned)
-            return data.get("entities", [])
-        except (json.JSONDecodeError, IndexError):
+            resp = await self.llm.ainvoke(messages)
+        except Exception:
             return []
+        data = parse_json_object(resp.content) or {}
+        raw_entities = data.get("entities", [])
+        if not isinstance(raw_entities, list):
+            return []
+        return list(dict.fromkeys(str(item).strip() for item in raw_entities if str(item).strip()))[:10]
 
     # ── Step 3: 子图检索 ─────────────────────────────────────
 
     async def _subgraph_search(self, entities: list[str], hops: int = 2) -> list[GraphRAGContext]:
         contexts: list[GraphRAGContext] = []
         for entity_name in entities:
-            neighbors = await self.knowledge_graph.get_neighbors(entity_name, hops=hops)
+            try:
+                neighbors = await self.knowledge_graph.get_neighbors(entity_name, hops=hops)
+            except Exception:
+                continue
             for record in neighbors:
+                if not isinstance(record, dict):
+                    continue
                 content = (
                     f"{record.get('source', '')} "
                     f"--[{', '.join(record.get('relations', []))}]--> "
@@ -140,12 +155,14 @@ class GraphRAGPipeline:
                     f"({record.get('target_type', '')}): "
                     f"{record.get('target_desc', '')}"
                 )
-                contexts.append(GraphRAGContext(
-                    content=content,
-                    source_type="subgraph",
-                    score=0.75,
-                    metadata={"entity": entity_name, "hops": hops},
-                ))
+                contexts.append(
+                    GraphRAGContext(
+                        content=content,
+                        source_type="subgraph",
+                        score=0.75,
+                        metadata={"entity": entity_name, "hops": hops},
+                    )
+                )
         return contexts
 
     # ── Step 4: 路径检索 ─────────────────────────────────────
@@ -179,12 +196,14 @@ class GraphRAGPipeline:
                             path_str += node
                             if k < len(rels):
                                 path_str += f" --[{rels[k]}]--> "
-                        contexts.append(GraphRAGContext(
-                            content=f"推理路径: {path_str}",
-                            source_type="path",
-                            score=0.85,
-                            metadata={"from": entities[i], "to": entities[j]},
-                        ))
+                        contexts.append(
+                            GraphRAGContext(
+                                content=f"推理路径: {path_str}",
+                                source_type="path",
+                                score=0.85,
+                                metadata={"from": entities[i], "to": entities[j]},
+                            )
+                        )
                 except Exception:
                     continue
         return contexts
@@ -198,11 +217,15 @@ class GraphRAGPipeline:
             SystemMessage(content=COMMUNITY_SUMMARY_PROMPT),
             HumanMessage(content=f"子图信息:\n{subgraph_text}"),
         ]
-        resp = await self.llm.ainvoke(messages)
+        try:
+            resp = await self.llm.ainvoke(messages)
+            content = str(resp.content).strip()
+        except Exception:
+            content = "\n".join(item.content for item in subgraph_results[:5])
         return GraphRAGContext(
-            content=resp.content,
+            content=content,
             source_type="community",
-            score=0.9,
+            score=0.9 if content else 0.0,
             metadata={"type": "community_summary"},
         )
 
@@ -218,16 +241,26 @@ class GraphRAGPipeline:
           - 社区摘要: 基础分 × 1.1  (高层概览)
         """
         weight_map = {"vector": 1.0, "subgraph": 1.15, "path": 1.25, "community": 1.1}
-        for ctx in contexts:
-            ctx.score *= weight_map.get(ctx.source_type, 1.0)
-
         seen: set[str] = set()
         unique: list[GraphRAGContext] = []
         for ctx in contexts:
-            key = ctx.content[:80]
+            content = " ".join(str(ctx.content or "").split()).strip()
+            if not content:
+                continue
+            key = content.casefold()
             if key not in seen:
                 seen.add(key)
-                unique.append(ctx)
+                unique.append(
+                    GraphRAGContext(
+                        content=content,
+                        source_type=ctx.source_type,
+                        score=min(
+                            max(coerce_float(ctx.score) * weight_map.get(ctx.source_type, 1.0), 0.0),
+                            1.0,
+                        ),
+                        metadata=dict(ctx.metadata),
+                    )
+                )
 
         unique.sort(key=lambda c: c.score, reverse=True)
         return unique

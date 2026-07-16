@@ -112,26 +112,32 @@ class KnowledgeUpdateAgent:
             old_hash = self._file_hashes.get(fp, "")
 
             if not old_hash:
-                changes.append(DocumentChange(
-                    file_path=fp,
-                    change_type=ChangeType.CREATED,
-                    new_hash=new_hash,
-                ))
+                changes.append(
+                    DocumentChange(
+                        file_path=fp,
+                        change_type=ChangeType.CREATED,
+                        new_hash=new_hash,
+                    )
+                )
             elif new_hash != old_hash:
-                changes.append(DocumentChange(
-                    file_path=fp,
-                    change_type=ChangeType.MODIFIED,
-                    old_hash=old_hash,
-                    new_hash=new_hash,
-                ))
+                changes.append(
+                    DocumentChange(
+                        file_path=fp,
+                        change_type=ChangeType.MODIFIED,
+                        old_hash=old_hash,
+                        new_hash=new_hash,
+                    )
+                )
             self._file_hashes[fp] = new_hash
 
         for fp in set(self._file_hashes) - current_files:
-            changes.append(DocumentChange(
-                file_path=fp,
-                change_type=ChangeType.DELETED,
-                old_hash=self._file_hashes[fp],
-            ))
+            changes.append(
+                DocumentChange(
+                    file_path=fp,
+                    change_type=ChangeType.DELETED,
+                    old_hash=self._file_hashes[fp],
+                )
+            )
             del self._file_hashes[fp]
 
         return changes
@@ -141,6 +147,7 @@ class KnowledgeUpdateAgent:
     def start_watching(self, directory: str) -> None:
         """启动文件系统监听（非阻塞，在独立线程运行）"""
         import threading
+
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
 
@@ -150,18 +157,21 @@ class KnowledgeUpdateAgent:
             def on_created(self, event):
                 if not event.is_directory:
                     import asyncio
+
                     change = DocumentChange(file_path=event.src_path, change_type=ChangeType.CREATED)
                     asyncio.run(agent.process_change(change))
 
             def on_modified(self, event):
                 if not event.is_directory:
                     import asyncio
+
                     change = DocumentChange(file_path=event.src_path, change_type=ChangeType.MODIFIED)
                     asyncio.run(agent.process_change(change))
 
             def on_deleted(self, event):
                 if not event.is_directory:
                     import asyncio
+
                     change = DocumentChange(file_path=event.src_path, change_type=ChangeType.DELETED)
                     asyncio.run(agent.process_change(change))
 
@@ -185,6 +195,7 @@ class KnowledgeUpdateAgent:
     async def start_kafka_consumer(self) -> None:
         """启动 Kafka CDC 消费者"""
         import json
+
         from confluent_kafka import Consumer
 
         conf = {
@@ -229,10 +240,14 @@ class KnowledgeUpdateAgent:
             for ext in extractions:
                 for ent in ext.entities:
                     version = self._bump_version(ent.name)
-                    await self.knowledge_graph.upsert_entity(ent, version=version)
+                    await self.knowledge_graph.upsert_entity(
+                        ent,
+                        version=version,
+                        source=change.file_path,
+                    )
                     result.entities_added += 1
                 for rel in ext.relations:
-                    await self.knowledge_graph.add_relation(rel)
+                    await self.knowledge_graph.add_relation(rel, source=change.file_path)
                     result.relations_added += 1
 
     async def _handle_modify(self, change: DocumentChange, result: UpdateResult) -> None:

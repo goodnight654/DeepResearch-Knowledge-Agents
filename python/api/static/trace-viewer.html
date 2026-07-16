@@ -330,6 +330,12 @@
         return String(v);
       }
 
+      function escapeHtml(value) {
+        const node = document.createElement("span");
+        node.textContent = fmt(value);
+        return node.innerHTML;
+      }
+
       function shortText(text, maxLen = 120) {
         if (!text) return "";
         return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
@@ -359,11 +365,11 @@
           card.className = `run-card${run.run_id === state.activeRunId ? " active" : ""}`;
           card.innerHTML = `
             <div class="run-row">
-              <span class="badge">${fmt(run.workflow)}</span>
-              <span class="badge">${fmt(run.status)}</span>
+              <span class="badge">${escapeHtml(run.workflow)}</span>
+              <span class="badge">${escapeHtml(run.status)}</span>
             </div>
-            <div class="run-id">${fmt(run.run_id)}</div>
-            <div class="run-q">${shortText(run.question || "(no question)")}</div>
+            <div class="run-id">${escapeHtml(run.run_id)}</div>
+            <div class="run-q">${escapeHtml(shortText(run.question || "(no question)"))}</div>
           `;
           card.addEventListener("click", () => {
             openRun(run.run_id, true);
@@ -404,10 +410,10 @@
         const meta = document.createElement("div");
         meta.className = "meta-grid";
         meta.innerHTML = `
-          <div class="meta-item"><div class="meta-k">Run ID</div><div class="meta-v mono">${fmt(record.run_id)}</div></div>
-          <div class="meta-item"><div class="meta-k">Workflow</div><div class="meta-v">${fmt(record.workflow)}</div></div>
-          <div class="meta-item"><div class="meta-k">Status</div><div class="meta-v">${fmt(record.status)}</div></div>
-          <div class="meta-item"><div class="meta-k">Created</div><div class="meta-v">${fmt(record.created_at)}</div></div>
+          <div class="meta-item"><div class="meta-k">Run ID</div><div class="meta-v mono">${escapeHtml(record.run_id)}</div></div>
+          <div class="meta-item"><div class="meta-k">Workflow</div><div class="meta-v">${escapeHtml(record.workflow)}</div></div>
+          <div class="meta-item"><div class="meta-k">Status</div><div class="meta-v">${escapeHtml(record.status)}</div></div>
+          <div class="meta-item"><div class="meta-k">Created</div><div class="meta-v">${escapeHtml(record.created_at)}</div></div>
         `;
         traceRootEl.appendChild(meta);
 
@@ -431,10 +437,10 @@
             ev.className = `event ${eventClass(name)}`;
             ev.innerHTML = `
               <div class="event-head">
-                <div class="event-name">${fmt(name)}</div>
-                <div class="event-time">${fmt(evt.ts)}</div>
+                <div class="event-name">${escapeHtml(name)}</div>
+                <div class="event-time">${escapeHtml(evt.ts)}</div>
               </div>
-              <pre class="event-pre">${prettyJson(evt.payload || {})}</pre>
+              <pre class="event-pre">${escapeHtml(prettyJson(evt.payload || {}))}</pre>
             `;
             timeline.appendChild(ev);
           }
@@ -445,9 +451,9 @@
         summary.className = "summary";
         summary.innerHTML = `
           <h3>Output Summary</h3>
-          <p><strong>confidence:</strong> ${fmt(output.confidence)} | <strong>iterations:</strong> ${fmt(output.iterations)}</p>
-          <p style="margin-top:8px;"><strong>executive_summary:</strong> ${fmt(output.executive_summary || "-")}</p>
-          <p style="margin-top:8px;"><strong>answer:</strong> ${fmt(output.answer || "-")}</p>
+          <p><strong>confidence:</strong> ${escapeHtml(output.confidence)} | <strong>iterations:</strong> ${escapeHtml(output.iterations)}</p>
+          <p style="margin-top:8px;"><strong>executive_summary:</strong> ${escapeHtml(output.executive_summary || "-")}</p>
+          <p style="margin-top:8px;"><strong>answer:</strong> ${escapeHtml(output.answer || "-")}</p>
         `;
         traceRootEl.appendChild(summary);
       }
@@ -472,7 +478,7 @@
           const record = await resp.json();
           renderTrace(record);
         } catch (err) {
-          traceRootEl.innerHTML = `<div class="empty">读取 run 失败: ${err.message}</div>`;
+          traceRootEl.innerHTML = `<div class="empty">读取 run 失败: ${escapeHtml(err.message)}</div>`;
         }
       }
 
@@ -480,7 +486,7 @@
         try {
           await fetchRuns();
         } catch (err) {
-          runListEl.innerHTML = `<div class="empty">加载 runs 失败: ${err.message}</div>`;
+          runListEl.innerHTML = `<div class="empty">加载 runs 失败: ${escapeHtml(err.message)}</div>`;
           return;
         }
 

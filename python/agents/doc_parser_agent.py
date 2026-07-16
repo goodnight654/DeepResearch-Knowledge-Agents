@@ -17,9 +17,8 @@ from enum import Enum
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from config import settings
+from utils.openai_clients import create_chat_model
 
 
 class DocType(str, Enum):
@@ -34,6 +33,7 @@ class DocType(str, Enum):
 @dataclass
 class DocumentChunk:
     """一个文档块，携带内容 + 元数据"""
+
     content: str
     doc_id: str
     chunk_index: int
@@ -69,19 +69,18 @@ class DocParserAgent:
     CHUNK_SIZE = 512
     CHUNK_OVERLAP = 64
 
-    def __init__(self) -> None:
-        self.llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+    def __init__(self, llm: Any = None) -> None:
+        self.llm = llm or create_chat_model()
 
     # ── public API ───────────────────────────────────────────
 
     async def parse(self, file_path: str) -> list[DocumentChunk]:
         """解析单个文件，返回文档块列表"""
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(file_path)
         doc_type = self._classify(file_path)
+        if doc_type == DocType.UNKNOWN:
+            raise ValueError(f"unsupported document type: {os.path.splitext(file_path)[1] or '[none]'}")
         doc_id = self._make_doc_id(file_path)
 
         raw_texts: list[str] = []
@@ -92,8 +91,6 @@ class DocParserAgent:
         elif doc_type == DocType.TABLE:
             raw_texts = await self._parse_table(file_path)
         elif doc_type in (DocType.TEXT, DocType.MARKDOWN):
-            raw_texts = self._parse_text(file_path)
-        else:
             raw_texts = self._parse_text(file_path)
 
         chunks = self._chunk_texts(raw_texts, doc_id, doc_type, file_path)
@@ -134,7 +131,7 @@ class DocParserAgent:
                 if page_text.strip():
                     texts.append(page_text.strip())
         except Exception:
-            texts.append(f"[PDF 解析失败] {file_path}")
+            texts = []
 
         if not texts:
             texts = await self._pdf_vision_fallback(file_path)
@@ -164,10 +161,16 @@ class DocParserAgent:
         if ocr_text.strip():
             texts.append(ocr_text)
 
-        from PIL import Image
-        img = Image.open(file_path)
-        description = await self._describe_image_with_llm(img)
-        texts.append(description)
+        try:
+            from PIL import Image
+
+            with Image.open(file_path) as img:
+                description = await self._describe_image_with_llm(img)
+            if str(description).strip():
+                texts.append(str(description))
+        except Exception:
+            if not texts:
+                texts.append(f"[图片解析失败] {file_path}")
         return texts
 
     @staticmethod
@@ -175,6 +178,7 @@ class DocParserAgent:
         try:
             import pytesseract
             from PIL import Image
+
             return pytesseract.image_to_string(Image.open(file_path), lang="chi_sim+eng")
         except Exception:
             return ""
@@ -189,14 +193,21 @@ class DocParserAgent:
         b64 = base64.b64encode(buf.getvalue()).decode()
 
         messages = [
-            SystemMessage(content="你是一个专业的文档分析助手，请详细描述图片中的内容，包括文字、表格、图表信息。"),
-            HumanMessage(content=[
-                {"type": "text", "text": "请描述这张图片的所有内容："},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]),
+            SystemMessage(
+                content="你是一个专业的文档分析助手，请详细描述图片中的内容，包括文字、表格、图表信息。"
+            ),
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "请描述这张图片的所有内容："},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]
+            ),
         ]
-        resp = await self.llm.ainvoke(messages)
-        return resp.content
+        try:
+            resp = await self.llm.ainvoke(messages)
+            return str(resp.content)
+        except Exception:
+            return "[视觉模型描述不可用]"
 
     # ── table parsing ────────────────────────────────────────
 
@@ -214,8 +225,9 @@ class DocParserAgent:
     @staticmethod
     def _parse_csv(file_path: str) -> list[str]:
         import csv
+
         texts: list[str] = []
-        with open(file_path, encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8-sig", errors="replace") as f:
             reader = csv.DictReader(f)
             headers = reader.fieldnames or []
             rows: list[str] = []
@@ -230,6 +242,7 @@ class DocParserAgent:
     def _parse_excel(file_path: str) -> list[str]:
         try:
             import openpyxl
+
             wb = openpyxl.load_workbook(file_path, read_only=True)
             texts: list[str] = []
             for sheet in wb.worksheets:
@@ -239,10 +252,12 @@ class DocParserAgent:
                 headers = [str(c) if c else "" for c in rows[0]]
                 data_rows: list[str] = []
                 for row in rows[1:]:
-                    data_rows.append(" | ".join(
-                        f"{headers[j]}: {row[j]}" if j < len(headers) else str(row[j])
-                        for j in range(len(row))
-                    ))
+                    data_rows.append(
+                        " | ".join(
+                            f"{headers[j]}: {row[j]}" if j < len(headers) else str(row[j])
+                            for j in range(len(row))
+                        )
+                    )
                 for i in range(0, len(data_rows), 20):
                     batch = data_rows[i : i + 20]
                     texts.append(f"工作表: {sheet.title}\n表头: {' | '.join(headers)}\n" + "\n".join(batch))
@@ -254,7 +269,7 @@ class DocParserAgent:
 
     @staticmethod
     def _parse_text(file_path: str) -> list[str]:
-        with open(file_path, encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8-sig", errors="replace") as f:
             return [f.read()]
 
     # ── chunking ─────────────────────────────────────────────
@@ -271,16 +286,20 @@ class DocParserAgent:
         for text in texts:
             start = 0
             while start < len(text):
-                end = start + self.CHUNK_SIZE
+                end = min(start + self.CHUNK_SIZE, len(text))
                 content = text[start:end]
                 if content.strip():
-                    chunks.append(DocumentChunk(
-                        content=content.strip(),
-                        doc_id=doc_id,
-                        chunk_index=idx,
-                        doc_type=doc_type,
-                        metadata={"source": source, "char_start": start, "char_end": end},
-                    ))
+                    chunks.append(
+                        DocumentChunk(
+                            content=content.strip(),
+                            doc_id=doc_id,
+                            chunk_index=idx,
+                            doc_type=doc_type,
+                            metadata={"source": source, "char_start": start, "char_end": end},
+                        )
+                    )
                     idx += 1
+                if end >= len(text):
+                    break
                 start = end - self.CHUNK_OVERLAP
         return chunks

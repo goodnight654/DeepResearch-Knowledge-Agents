@@ -17,10 +17,10 @@ from enum import Enum
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
 from services.hybrid_retriever import HybridRetriever, RetrievedContext
+from utils.openai_clients import create_chat_model
 
 
 class QueryIntent(str, Enum):
@@ -79,12 +79,7 @@ class QAAgent:
         retriever: HybridRetriever | None = None,
         llm: Any = None,
     ) -> None:
-        self.llm = llm or ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+        self.llm = llm or create_chat_model()
         self.retriever = retriever or HybridRetriever(
             vector_store=vector_store,
             knowledge_graph=knowledge_graph,

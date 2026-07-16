@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+uploads/
+run_traces/
+python/uploads/
+python/run_traces/
+

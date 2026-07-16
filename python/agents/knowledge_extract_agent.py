@@ -10,15 +10,14 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from agents.doc_parser_agent import DocumentChunk
-from config import settings
+from utils.json_utils import coerce_float, parse_json_object
+from utils.openai_clients import create_chat_model
 
 EXTRACTION_SYSTEM_PROMPT = """\
 你是一个专业的知识抽取引擎。给定一段文本，请提取其中的：
@@ -93,13 +92,8 @@ class KnowledgeExtractAgent:
 
     BATCH_SIZE = 5
 
-    def __init__(self) -> None:
-        self.llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+    def __init__(self, llm: Any = None) -> None:
+        self.llm = llm or create_chat_model()
 
     # ── public API ───────────────────────────────────────────
 
@@ -128,18 +122,23 @@ class KnowledgeExtractAgent:
             SystemMessage(content=EXTRACTION_SYSTEM_PROMPT),
             HumanMessage(content=f"请从以下文本中抽取知识：\n\n{text}"),
         ]
-        resp = await self.llm.ainvoke(messages)
-        return self._parse_response(resp.content, source_id)
+        try:
+            resp = await self.llm.ainvoke(messages)
+        except Exception:
+            return ExtractionResult(entities=[], relations=[], events=[], source_chunk_id=source_id)
+        return self._parse_response(str(resp.content), source_id)
 
     def _parse_response(self, raw: str, source_id: str) -> ExtractionResult:
-        try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1]
-                cleaned = cleaned.rsplit("```", 1)[0]
-            data = json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError):
+        data = parse_json_object(raw)
+        if data is None:
             return ExtractionResult(entities=[], relations=[], events=[], source_chunk_id=source_id)
+
+        raw_entities = data.get("entities", [])
+        raw_relations = data.get("relations", [])
+        raw_events = data.get("events", [])
+        raw_entities = raw_entities if isinstance(raw_entities, list) else []
+        raw_relations = raw_relations if isinstance(raw_relations, list) else []
+        raw_events = raw_events if isinstance(raw_events, list) else []
 
         entities = [
             Entity(
@@ -147,18 +146,18 @@ class KnowledgeExtractAgent:
                 type=e.get("type", "Concept"),
                 description=e.get("description", ""),
             )
-            for e in data.get("entities", [])
-            if e.get("name")
+            for e in raw_entities
+            if isinstance(e, dict) and e.get("name")
         ]
         relations = [
             Relation(
                 head=r.get("head", ""),
                 relation=r.get("relation", "related_to"),
                 tail=r.get("tail", ""),
-                confidence=float(r.get("confidence", 0.5)),
+                confidence=min(max(coerce_float(r.get("confidence"), 0.5), 0.0), 1.0),
             )
-            for r in data.get("relations", [])
-            if r.get("head") and r.get("tail")
+            for r in raw_relations
+            if isinstance(r, dict) and r.get("head") and r.get("tail")
         ]
         events = [
             KnowledgeEvent(
@@ -166,7 +165,8 @@ class KnowledgeExtractAgent:
                 type=ev.get("type", ""),
                 participants=ev.get("participants", []),
             )
-            for ev in data.get("events", [])
+            for ev in raw_events
+            if isinstance(ev, dict)
         ]
         return ExtractionResult(
             entities=entities,
@@ -201,10 +201,12 @@ class KnowledgeExtractAgent:
                     seen_relations.add(key)
                     unique_relations.append(rel)
 
-            deduped.append(ExtractionResult(
-                entities=unique_entities,
-                relations=unique_relations,
-                events=result.events,
-                source_chunk_id=result.source_chunk_id,
-            ))
+            deduped.append(
+                ExtractionResult(
+                    entities=unique_entities,
+                    relations=unique_relations,
+                    events=result.events,
+                    source_chunk_id=result.source_chunk_id,
+                )
+            )
         return deduped

@@ -13,16 +13,21 @@ DeepResearch Agent — 计划驱动的多轮检索、网页阅读、证据归因
 
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
 from services.hybrid_retriever import HybridRetriever, RetrievedContext
+from utils.json_utils import coerce_float, parse_json_object
+from utils.openai_clients import create_chat_model
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,6 +60,8 @@ class DeepResearchResult:
     steps: list[DeepResearchStep]
     evidence: list[DeepResearchEvidence]
     confidence: float
+    cited_evidence_ids: list[str] = field(default_factory=list)
+    citation_warnings: list[str] = field(default_factory=list)
 
     @property
     def iterations(self) -> int:
@@ -122,12 +129,7 @@ class DeepResearchAgent:
         retriever: HybridRetriever | None = None,
         llm: Any = None,
     ) -> None:
-        self.llm = llm or ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+        self.llm = llm or create_chat_model()
         self.retriever = retriever or HybridRetriever(
             vector_store=vector_store,
             knowledge_graph=knowledge_graph,
@@ -141,22 +143,27 @@ class DeepResearchAgent:
         self.final_context_limit = settings.deepresearch_final_context_limit
 
     async def research(self, question: str) -> DeepResearchResult:
+        question = self.normalize_question(question)
         plan = await self.plan_search(question)
         focus = str(plan.get("goal") or question)
         frontier = self.initial_frontier(plan, question)
 
         all_contexts: list[RetrievedContext] = []
         steps: list[DeepResearchStep] = []
+        attempted_queries: set[str] = set()
         confidence = 0.0
 
         for iteration in range(1, self.max_iterations + 1):
-            queries = frontier[: self.queries_per_iteration] or [question]
+            queries = self.select_queries(frontier, attempted_queries, fallback=question)
+            if not queries:
+                break
+            attempted_queries.update(query.casefold() for query in queries)
             round_contexts = await self.retrieve_round(queries)
             all_contexts = self.merge_contexts(all_contexts + round_contexts)
 
             summary = await self.summarize_round(question, focus, queries, all_contexts)
             gap_state = await self.analyze_gaps(question, focus, steps, summary, all_contexts)
-            confidence = float(gap_state.get("confidence", confidence or 0.0))
+            confidence = coerce_float(gap_state.get("confidence"), confidence or 0.0)
 
             steps.append(
                 self.make_step(
@@ -169,16 +176,19 @@ class DeepResearchAgent:
                 )
             )
 
-            follow_up = self.clean_list(gap_state.get("follow_up_queries"))
+            follow_up = self.select_queries(
+                self.clean_list(gap_state.get("follow_up_queries")),
+                attempted_queries,
+            )
             if self.should_finalize(iteration, gap_state, follow_up):
                 break
 
             focus = str(gap_state.get("next_focus") or focus)
             frontier = follow_up
 
-        contexts = self.merge_contexts(all_contexts)[: self.final_context_limit]
+        contexts = self.select_final_contexts(all_contexts)
         evidence = self.build_evidence(contexts)
-        executive_summary, answer, final_confidence = await self.compose_answer(
+        executive_summary, answer, final_confidence, cited_ids, citation_warnings = await self.compose_answer(
             question=question,
             plan=plan,
             steps=steps,
@@ -194,12 +204,15 @@ class DeepResearchAgent:
             steps=steps,
             evidence=evidence,
             confidence=final_confidence,
+            cited_evidence_ids=cited_ids,
+            citation_warnings=citation_warnings,
         )
 
     async def search(self, question: str) -> DeepResearchResult:
         return await self.research(question)
 
     async def plan_search(self, question: str) -> dict[str, Any]:
+        question = self.normalize_question(question)
         plan = await self._load_json_response(
             SEARCH_PLAN_PROMPT,
             question,
@@ -221,13 +234,24 @@ class DeepResearchAgent:
 
     async def retrieve_round(self, queries: list[str]) -> list[RetrievedContext]:
         contexts: list[RetrievedContext] = []
-        for query in queries[: self.queries_per_iteration]:
-            _, hits = await self.retriever.retrieve(
-                query,
-                top_k=self.contexts_per_query,
-                per_query_limit=self.contexts_per_query,
-                web_limit=min(self.contexts_per_query, settings.web_search_top_k),
-            )
+        selected = queries[: self.queries_per_iteration]
+        results = await asyncio.gather(
+            *(
+                self.retriever.retrieve(
+                    query,
+                    top_k=self.contexts_per_query,
+                    per_query_limit=self.contexts_per_query,
+                    web_limit=min(self.contexts_per_query, settings.web_search_top_k),
+                )
+                for query in selected
+            ),
+            return_exceptions=True,
+        )
+        for query, result in zip(selected, results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning("DeepResearch query failed for %r: %s", query, result)
+                continue
+            _, hits = result
             contexts.extend(hits)
         return contexts
 
@@ -272,21 +296,41 @@ class DeepResearchAgent:
             f"当前焦点: {focus}\n"
             f"已有阶段总结:\n{prior_summaries or '[无]'}\n\n"
             f"本轮总结:\n{summary}\n\n"
-            f"当前可用上下文数: {len(contexts)}"
+            f"当前可用上下文数: {len(contexts)}\n"
+            f"当前独立来源数: {len(self.context_sources(contexts))}\n"
+            f"建议最低证据数: {settings.deepresearch_min_evidence}\n"
+            f"建议最低独立来源数: {settings.deepresearch_min_sources}"
         )
+        enough_evidence = len(contexts) >= settings.deepresearch_min_evidence
+        enough_sources = len(self.context_sources(contexts)) >= settings.deepresearch_min_sources
         result = await self._load_json_response(
             GAP_ANALYSIS_PROMPT,
             payload,
             fallback={
-                "answered": len(contexts) >= self.final_context_limit,
-                "confidence": min(len(contexts) / max(self.final_context_limit, 1), 1.0),
+                "answered": enough_evidence and enough_sources,
+                "confidence": 0.0,
                 "next_focus": focus,
                 "gaps": [],
                 "follow_up_queries": [],
             },
         )
         result["gaps"] = self.clean_list(result.get("gaps"))
-        result["follow_up_queries"] = self.clean_list(result.get("follow_up_queries"))
+        result["confidence"] = min(max(coerce_float(result.get("confidence")), 0.0), 1.0)
+        result["answered"] = bool(result.get("answered")) and enough_evidence and enough_sources
+
+        follow_up = self.clean_list(result.get("follow_up_queries"))
+        if not result["answered"] and not follow_up and len(steps) + 1 < self.max_iterations:
+            variants = (
+                f"{question} 官方资料 原始来源",
+                f"{question} 独立分析 交叉验证",
+                f"{question} 最新证据 风险限制",
+            )
+            follow_up = [variants[min(len(steps), len(variants) - 1)]]
+            if not enough_evidence:
+                result["gaps"] = self.clean_list(result["gaps"] + ["证据数量不足"])
+            if not enough_sources:
+                result["gaps"] = self.clean_list(result["gaps"] + ["独立来源不足"])
+        result["follow_up_queries"] = follow_up
         return result
 
     async def compose_answer(
@@ -297,7 +341,7 @@ class DeepResearchAgent:
         contexts: list[RetrievedContext],
         evidence: list[DeepResearchEvidence],
         fallback_confidence: float,
-    ) -> tuple[str, str, float]:
+    ) -> tuple[str, str, float, list[str], list[str]]:
         steps_text = "\n\n".join(
             (
                 f"第 {step.iteration} 轮\n"
@@ -316,19 +360,22 @@ class DeepResearchAgent:
             f"证据列表:\n{self.format_evidence(evidence)}\n\n"
             f"关键上下文:\n{self.format_contexts(contexts)}"
         )
+        fallback_answer = self._fallback_answer(evidence, steps)
         result = await self._load_json_response(
             FINAL_SYNTHESIS_PROMPT,
             payload,
             fallback={
                 "executive_summary": steps[-1].summary if steps else "暂无搜索摘要。",
-                "answer": steps[-1].summary if steps else "暂无答案。",
+                "answer": fallback_answer,
                 "confidence": fallback_confidence,
             },
         )
         executive_summary = str(result.get("executive_summary") or "暂无搜索摘要。")
         answer = str(result.get("answer") or executive_summary)
-        confidence = float(result.get("confidence", fallback_confidence or 0.0))
-        return executive_summary, answer, min(max(confidence, 0.0), 1.0)
+        answer, cited_ids, warnings = self.validate_citations(answer, evidence)
+        model_confidence = coerce_float(result.get("confidence"), fallback_confidence or 0.0)
+        confidence = self.calibrate_confidence(model_confidence, evidence, cited_ids)
+        return executive_summary, answer, confidence, cited_ids, warnings
 
     @staticmethod
     def build_result(
@@ -339,6 +386,8 @@ class DeepResearchAgent:
         steps: list[DeepResearchStep],
         evidence: list[DeepResearchEvidence],
         confidence: float,
+        cited_evidence_ids: list[str] | None = None,
+        citation_warnings: list[str] | None = None,
     ) -> DeepResearchResult:
         return DeepResearchResult(
             question=question,
@@ -347,7 +396,9 @@ class DeepResearchAgent:
             contexts=contexts,
             steps=steps,
             evidence=evidence,
-            confidence=confidence,
+            confidence=min(max(coerce_float(confidence), 0.0), 1.0),
+            cited_evidence_ids=cited_evidence_ids or [],
+            citation_warnings=citation_warnings or [],
         )
 
     def make_step(
@@ -395,15 +446,14 @@ class DeepResearchAgent:
         except Exception:
             return fallback
 
-        cleaned = str(resp.content).strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
+        return parse_json_object(resp.content) or fallback
 
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            return fallback
-        return data if isinstance(data, dict) else fallback
+    @staticmethod
+    def normalize_question(question: str) -> str:
+        value = " ".join(str(question or "").split()).strip()
+        if not value:
+            raise ValueError("question must not be empty")
+        return value
 
     @staticmethod
     def clean_list(raw: Any) -> list[str]:
@@ -412,19 +462,77 @@ class DeepResearchAgent:
         values = [str(item).strip() for item in raw if item is not None and str(item).strip()]
         return list(dict.fromkeys(values))
 
+    def select_queries(
+        self,
+        candidates: Any,
+        attempted_queries: set[str],
+        fallback: str = "",
+    ) -> list[str]:
+        values = self.clean_list(candidates)
+        if not values and fallback:
+            values = [fallback]
+        selected = [value for value in values if value.casefold() not in attempted_queries]
+        return selected[: self.queries_per_iteration]
+
     def merge_contexts(self, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
         deduped: dict[tuple[str, str], RetrievedContext] = {}
         for ctx in contexts:
-            key = (ctx.source, ctx.content[:160])
+            content = " ".join(str(ctx.content or "").split()).strip()
+            if not content:
+                continue
+            source = str(ctx.source or ctx.metadata.get("url") or "unknown").strip()
+            candidate = RetrievedContext(
+                content=content,
+                source=source,
+                score=min(max(coerce_float(ctx.score), 0.0), 1.0),
+                retrieval_type=ctx.retrieval_type,
+                metadata=dict(ctx.metadata),
+            )
+            key = (self.context_source(candidate), content.casefold())
             existing = deduped.get(key)
-            if existing is None or ctx.score > existing.score:
-                deduped[key] = ctx
+            if existing is None or candidate.score > existing.score:
+                deduped[key] = candidate
         merged = list(deduped.values())
         merged.sort(key=lambda item: item.score, reverse=True)
         return merged
 
+    def select_final_contexts(self, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+        """Prefer source diversity before filling remaining slots by score."""
+        ordered = self.merge_contexts(contexts)
+        selected: list[RetrievedContext] = []
+        seen_sources: set[str] = set()
+        for ctx in ordered:
+            source_key = self.context_source(ctx)
+            if source_key in seen_sources:
+                continue
+            selected.append(ctx)
+            seen_sources.add(source_key)
+            if len(selected) >= self.final_context_limit:
+                return selected
+        for ctx in ordered:
+            if ctx not in selected:
+                selected.append(ctx)
+                if len(selected) >= self.final_context_limit:
+                    break
+        return selected
+
+    @staticmethod
+    def context_source(context: RetrievedContext) -> str:
+        return (
+            str(context.metadata.get("url") or context.source or "unknown")
+            .split("#", 1)[0]
+            .rstrip("/")
+            .casefold()
+        )
+
+    @classmethod
+    def context_sources(cls, contexts: list[RetrievedContext]) -> set[str]:
+        return {cls.context_source(context) for context in contexts}
+
     @staticmethod
     def format_contexts(contexts: list[RetrievedContext]) -> str:
+        if not contexts:
+            return "[无可用上下文]"
         return "\n\n".join(
             f"[来源 {index + 1}: {ctx.source} | 类型: {ctx.retrieval_type} | 分数: {ctx.score:.2f}]\n{ctx.content}"
             for index, ctx in enumerate(contexts)
@@ -444,7 +552,7 @@ class DeepResearchAgent:
                     source=ctx.source,
                     title=str(ctx.metadata.get("title", ctx.source)),
                     quote=quote,
-                    confidence=min(max(float(ctx.score), 0.0), 1.0),
+                    confidence=min(max(coerce_float(ctx.score), 0.0), 1.0),
                     retrieved_at=str(ctx.metadata.get("retrieved_at", now)),
                     metadata={
                         "retrieval_type": ctx.retrieval_type,
@@ -453,6 +561,69 @@ class DeepResearchAgent:
                 )
             )
         return evidence
+
+    @staticmethod
+    def _fallback_answer(
+        evidence: list[DeepResearchEvidence],
+        steps: list[DeepResearchStep],
+    ) -> str:
+        if evidence:
+            lines = ["模型未返回可解析的结构化答案，以下是已检索到的证据摘要："]
+            lines.extend(f"- {item.quote} [{item.evidence_id}]" for item in evidence[:5])
+            return "\n".join(lines)
+        return steps[-1].summary if steps else "未检索到足以回答问题的证据。"
+
+    @staticmethod
+    def validate_citations(
+        answer: str,
+        evidence: list[DeepResearchEvidence],
+    ) -> tuple[str, list[str], list[str]]:
+        valid_ids = {item.evidence_id for item in evidence}
+        cited_ids: list[str] = []
+        invalid_ids: list[str] = []
+
+        def _replace(match: re.Match[str]) -> str:
+            evidence_id = match.group(1).upper()
+            if evidence_id in valid_ids:
+                if evidence_id not in cited_ids:
+                    cited_ids.append(evidence_id)
+                return f"[{evidence_id}]"
+            if evidence_id not in invalid_ids:
+                invalid_ids.append(evidence_id)
+            return ""
+
+        cleaned = re.sub(r"\[(E\d+)\]", _replace, str(answer or ""), flags=re.IGNORECASE)
+        cleaned = re.sub(r"[ \t]+([，。；：,.!?])", r"\1", cleaned).strip()
+        warnings: list[str] = []
+        if invalid_ids:
+            warnings.append(f"已移除不存在的证据引用: {', '.join(invalid_ids)}")
+        if evidence and not cited_ids:
+            appendix = "；".join(f"[{item.evidence_id}] {item.title}" for item in evidence[:3])
+            cleaned = f"{cleaned}\n\n证据索引：{appendix}".strip()
+            cited_ids = [item.evidence_id for item in evidence[:3]]
+            warnings.append("模型回答未包含有效证据引用，系统已附加证据索引。")
+        if not evidence:
+            warnings.append("本次研究未检索到可引用证据。")
+        return cleaned or "未生成有效答案。", cited_ids, warnings
+
+    @classmethod
+    def calibrate_confidence(
+        cls,
+        model_confidence: float,
+        evidence: list[DeepResearchEvidence],
+        cited_ids: list[str],
+    ) -> float:
+        if not evidence:
+            return 0.0
+        model_score = min(max(coerce_float(model_confidence), 0.0), 1.0)
+        average_evidence = sum(item.confidence for item in evidence) / len(evidence)
+        sources = {item.source.split("#", 1)[0].rstrip("/").casefold() for item in evidence}
+        diversity = min(len(sources) / max(settings.deepresearch_min_sources, 1), 1.0)
+        citation_coverage = min(len(cited_ids) / max(min(len(evidence), 3), 1), 1.0)
+        evidence_score = min(
+            max(average_evidence * 0.55 + diversity * 0.25 + citation_coverage * 0.20, 0.0), 1.0
+        )
+        return min(model_score, evidence_score) if model_score else evidence_score * 0.8
 
     @staticmethod
     def format_evidence(evidence: list[DeepResearchEvidence]) -> str:

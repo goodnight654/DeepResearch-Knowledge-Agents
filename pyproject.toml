@@ -1,0 +1,18 @@
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["python/tests"]
+pythonpath = ["python"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:Warning",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

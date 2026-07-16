@@ -5,7 +5,10 @@ Web page reader — fetch, clean, and chunk web pages for DeepResearch evidence.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import re
+import socket
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,7 +29,18 @@ class WebPageChunk:
 
 
 class _ReadableHTMLParser(HTMLParser):
-    SKIP_TAGS = {"script", "style", "noscript", "svg", "canvas", "iframe"}
+    SKIP_TAGS = {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "canvas",
+        "iframe",
+        "nav",
+        "footer",
+        "form",
+        "button",
+    }
     BLOCK_TAGS = {"p", "div", "section", "article", "li", "br", "h1", "h2", "h3", "h4", "tr"}
 
     def __init__(self) -> None:
@@ -76,6 +90,7 @@ class WebPageReader:
         self.timeout = max(1, settings.web_page_timeout_seconds)
         self.max_chars = max(1000, settings.web_page_max_chars)
         self.chunks_per_result = max(1, settings.web_page_chunks_per_result)
+        self.block_private_networks = settings.web_page_block_private_networks
 
     async def read(
         self,
@@ -84,7 +99,7 @@ class WebPageReader:
         score: float = 1.0,
         max_chunks: int | None = None,
     ) -> list[WebPageChunk]:
-        if not self.enabled or not url.startswith(("http://", "https://")):
+        if not self.enabled or not self._is_allowed_url(url, resolve_dns=False):
             return []
 
         html = await self._fetch(url)
@@ -111,48 +126,109 @@ class WebPageReader:
 
     async def _fetch(self, url: str) -> str:
         def _do_fetch() -> str:
+            if not self._is_allowed_url(url, resolve_dns=self.block_private_networks):
+                return ""
+
+            reader = self
+
+            class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    if not reader._is_allowed_url(
+                        urllib.parse.urljoin(req.full_url, newurl),
+                        resolve_dns=reader.block_private_networks,
+                    ):
+                        raise ValueError("redirect target is not allowed")
+                    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
             request = urllib.request.Request(
                 url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (compatible; DeepResearchKnowledgeHub/1.0)"
-                    )
-                },
+                headers={"User-Agent": ("Mozilla/5.0 (compatible; DeepResearchKnowledgeHub/1.0)")},
             )
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                content_type = response.headers.get("Content-Type", "")
+            opener = urllib.request.build_opener(_SafeRedirectHandler())
+            with opener.open(request, timeout=self.timeout) as response:
+                content_type = response.headers.get("Content-Type", "").lower()
                 if "text/html" not in content_type and "text/plain" not in content_type:
                     return ""
                 raw = response.read(self.max_chars * 4)
-            return raw.decode("utf-8", errors="ignore")
+                charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                return raw.decode(charset, errors="replace")
+            except LookupError:
+                return raw.decode("utf-8", errors="replace")
 
         try:
             return await asyncio.to_thread(_do_fetch)
         except Exception:
             return ""
 
+    def _is_allowed_url(self, url: str, *, resolve_dns: bool) -> bool:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            return False
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if not self.block_private_networks:
+            return True
+
+        hostname = parsed.hostname.rstrip(".").casefold()
+        if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
+            return False
+        try:
+            direct_ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            direct_ip = None
+        if direct_ip is not None:
+            return direct_ip.is_global
+        if not resolve_dns:
+            return True
+        try:
+            addresses = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        except OSError:
+            return False
+        resolved = {item[4][0].split("%", 1)[0] for item in addresses if item and item[4]}
+        if not resolved:
+            return False
+        try:
+            return all(ipaddress.ip_address(address).is_global for address in resolved)
+        except ValueError:
+            return False
+
     @staticmethod
     def _extract_text(html: str) -> tuple[str, str]:
         parser = _ReadableHTMLParser()
         parser.feed(html)
         text = parser.text()
-        text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"(\s*\n\s*)+", "\n", text)
+        text = re.sub(r"[\t\r\f\v ]+", " ", text)
+        text = re.sub(r" *(?:\n *)+", "\n", text).strip()
         return parser.title.strip(), text
 
     @staticmethod
-    def _chunk_text(text: str, max_chunks: int, chunk_size: int = 1600) -> list[str]:
-        if not text:
+    def _chunk_text(
+        text: str,
+        max_chunks: int,
+        chunk_size: int = 1600,
+        overlap: int = 120,
+    ) -> list[str]:
+        if not text or max_chunks <= 0 or chunk_size <= 0:
             return []
+        overlap = min(max(overlap, 0), max(chunk_size - 1, 0))
         chunks: list[str] = []
         cursor = 0
         while cursor < len(text) and len(chunks) < max_chunks:
             end = min(cursor + chunk_size, len(text))
-            boundary = text.rfind(". ", cursor, end)
-            if boundary > cursor + 400:
-                end = boundary + 1
+            if end < len(text):
+                boundaries = [text.rfind(mark, cursor, end) for mark in ("。", "！", "？", ". ", "\n")]
+                boundary = max(boundaries)
+                if boundary > cursor + max(chunk_size // 3, 1):
+                    end = boundary + 1
             chunk = text[cursor:end].strip()
             if chunk:
                 chunks.append(chunk)
-            cursor = end
+            if end >= len(text):
+                break
+            next_cursor = end - overlap
+            cursor = next_cursor if next_cursor > cursor else end
         return chunks

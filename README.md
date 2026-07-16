@@ -13,7 +13,7 @@
 
 中文项目名是“智能资料研究助手”，英文代号是 DeepResearch Knowledge Hub。4 个基础智能体负责文档解析、知识抽取、智能问答和增量更新；深度研究智能体负责多轮规划、检索、网页阅读、证据归因与最终综合回答。
 
-[GitHub 仓库](https://github.com/goodnight654/DeepResearch-Knowledge-Agents) · [快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [v2增强](#-v2-增强deepresearch--trace可视化) · [API文档](#-api-接口) · [面试资料](#-面试资料)
+[GitHub 仓库](https://github.com/goodnight654/DeepResearch-Knowledge-Agents) · [快速开始](#-快速开始) · [DeepResearch 教程](./docs/deepresearch-tutorial.md) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [API文档](#-api-接口) · [面试资料](#-面试资料)
 
 </div>
 
@@ -290,7 +290,7 @@ pip install -r requirements.txt
 python -m api.main
 ```
 
-看到 `Uvicorn running on http://0.0.0.0:8080` 就说明启动成功了！
+看到 `Uvicorn running on http://0.0.0.0:8080` 就说明启动成功了。即使 Neo4j 或 Chroma 暂时不可用，API 也会以降级模式启动，并在健康检查的 `components` 字段中显示状态。
 
 ### 步骤5：验证服务
 
@@ -343,9 +343,9 @@ chunks = await agent.parse("财务数据.xlsx")   # Excel → 结构化文本
 chunks = await agent.parse("产品文档.md")     # Markdown → 纯文本
 
 # 每个chunk包含：
-# chunk.text      - 文本内容
+# chunk.content   - 文本内容
 # chunk.metadata  - 来源文件、页码、类型等
-# chunk.embedding - 向量表示（自动生成）
+# chunk.embedding - 可选向量表示（真正入库时由 VectorStoreService 生成）
 ```
 
 ### 功能2：知识图谱自动构建
@@ -378,19 +378,21 @@ result = await extractor.extract(chunks)
 
 ```python
 from agents.qa_agent import QAAgent
-from services.vector_store import VectorStore
+from services.vector_store import VectorStoreService
 from services.knowledge_graph import KnowledgeGraphService
 
 # 初始化
-vs = VectorStore()
+vs = VectorStoreService()
 kg = KnowledgeGraphService()
+await vs.init()
+await kg.init()
 qa = QAAgent(vector_store=vs, knowledge_graph=kg)
 
 # 提问（支持复杂的多跳推理问题）
 result = await qa.answer("张三负责的产品，它的主要竞争对手是谁？")
 
 print(result.answer)     # 生成的自然语言答案
-print(result.sources)    # 来源引用（哪些文档/哪些知识图谱节点）
+print(result.contexts)   # 来源上下文（哪些文档/哪些知识图谱节点）
 print(result.confidence) # 置信度分数
 
 # 内部执行流程：
@@ -422,11 +424,12 @@ update_agent = KnowledgeUpdateAgent(...)
 #   3. 只更新第3页相关的向量和知识图谱节点
 #   耗时：~30 秒（快60倍！）
 
-await update_agent.process_cdc_event(event={
-    "operation": "UPDATE",
-    "resource_path": "/docs/年度报告.pdf",
-    "changed_pages": [3]
-})
+from agents.knowledge_update_agent import ChangeType, DocumentChange
+
+result = await update_agent.process_change(DocumentChange(
+    file_path="/docs/年度报告.pdf",
+    change_type=ChangeType.MODIFIED,
+))
 ```
 
 ### 功能5：DeepResearch 多轮研究式检索（新增）
@@ -450,6 +453,8 @@ plan_search -> retrieve_round -> summarize_round -> assess_gap
 ```
 
 每轮输出都会进入 trace，用于回放和调试。
+
+完整配置、离线降级、证据引用、测试和故障排查请阅读 [`docs/deepresearch-tutorial.md`](./docs/deepresearch-tutorial.md)。
 
 ### 功能6：Trace 可视化页面（新增）
 
@@ -523,6 +528,7 @@ DeepResearch-Knowledge-Agents/
 │   ├── resume-template.md             ← 简历写法模板
 │   ├── resume-deepresearch-v2.md        ← DeepResearch增强简历模板（新增）
 │   ├── tech-deep-dive.md              ← 核心代码逐行讲解
+│   ├── deepresearch-tutorial.md        ← DeepResearch 配置、调用、测试与扩展教程
 │   └── project-plan.md               ← 项目规划方案
 │
 ├── python/                            ← Python实现（功能最完整，推荐）
@@ -610,6 +616,7 @@ DeepResearch-Knowledge-Agents/
 | [**简历写法模板**](./docs/resume-template.md) | 怎么把这个项目写进简历（量化指标怎么写） | 投简历前 |
 | [**DeepResearch增强简历版**](./docs/resume-deepresearch-v2.md) | 包含DeepResearch/Web Search/Trace Viewer的新版简历 | 投递Agent岗位前 |
 | [**核心代码讲解**](./docs/tech-deep-dive.md) | 关键代码逐行解读，搞懂原理 | 代码层面被追问时 |
+| [**DeepResearch 完整教程**](./docs/deepresearch-tutorial.md) | 配置、调用、证据引用、Trace、测试和排错 | 运行或二次开发前 |
 | [**项目规划方案**](./docs/project-plan.md) | 完整的项目设计方案 | 理解整体思路 |
 
 ### 面试中如何介绍这个项目（STAR法则）
@@ -705,9 +712,9 @@ Neo4j、ChromaDB/PGVector 和 Kafka 需要单独启动。Neo4j 需要的内存�
 ### Q: 如何运行测试？
 
 ```bash
-# Python
-cd python
-pytest tests/
+# 在仓库根目录
+python -m pytest
+ruff check python
 ```
 
 ---

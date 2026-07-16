@@ -9,16 +9,20 @@ FastAPI 入口 — DeepResearch Knowledge Hub REST API
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
-import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, List
+from pathlib import Path
+from typing import Annotated, Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
+from agents.doc_parser_agent import DocParserAgent
 from agents.knowledge_update_agent import ChangeType, DocumentChange
 from config import settings
 from orchestrator.graph import build_knowledge_graph_workflow
@@ -27,6 +31,8 @@ from services.run_trace_store import RunTraceStore
 from services.vector_store import VectorStoreService
 from services.web_page_reader import WebPageReader
 from services.web_search import WebSearchService
+
+logger = logging.getLogger(__name__)
 
 vector_store = VectorStoreService()
 knowledge_graph = KnowledgeGraphService()
@@ -39,14 +45,17 @@ workflows: dict[str, Any] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(settings.upload_dir, exist_ok=True)
-    try:
-        await vector_store.init()
-    except Exception:
-        pass
-    try:
-        await knowledge_graph.init()
-    except Exception:
-        pass
+
+    async def initialize(name: str, initializer: Any) -> None:
+        try:
+            await asyncio.wait_for(initializer(), timeout=settings.dependency_init_timeout_seconds)
+        except Exception as exc:
+            logger.warning("%s unavailable; retrieval will degrade gracefully: %s", name, exc)
+
+    await asyncio.gather(
+        initialize("vector store", vector_store.init),
+        initialize("knowledge graph", knowledge_graph.init),
+    )
     workflows.update(
         build_knowledge_graph_workflow(
             vector_store=vector_store,
@@ -69,8 +78,17 @@ app = FastAPI(
 
 # ── Request / Response Models ────────────────────────────────
 
+
 class QuestionRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=8000)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("question must not be empty")
+        return normalized
 
 
 class QuestionResponse(BaseModel):
@@ -110,6 +128,8 @@ class DeepResearchResponse(BaseModel):
     iterations: int
     steps: list[DeepResearchStepResponse]
     evidence: list[EvidenceResponse]
+    cited_evidence_ids: list[str]
+    citation_warnings: list[str]
     sources: list[dict[str, Any]]
 
 
@@ -131,8 +151,8 @@ class StatsResponse(BaseModel):
 
 
 class UpdateRequest(BaseModel):
-    file_path: str
-    change_type: str = "modified"
+    file_path: str = Field(min_length=1)
+    change_type: ChangeType = ChangeType.MODIFIED
 
 
 class UpdateResponse(BaseModel):
@@ -169,16 +189,14 @@ class RunTraceSummaryResponse(BaseModel):
 
 # ── Ingest Endpoints ─────────────────────────────────────────
 
-@app.post("/api/ingest/upload", response_model=IngestResponse, tags=["文档入库"])
-async def upload_document(file: UploadFile = File(...)):
-    """上传并解析文档，自动入库到向量库和知识图谱"""
-    save_path = os.path.join(settings.upload_dir, file.filename or "unknown")
-    with open(save_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
 
+@app.post("/api/ingest/upload", response_model=IngestResponse, tags=["文档入库"])
+async def upload_document(file: Annotated[UploadFile, File()]):
+    """上传并解析文档，自动入库到向量库和知识图谱"""
     ingest_wf = workflows.get("ingest")
     if not ingest_wf:
         raise HTTPException(status_code=503, detail="Ingest workflow not initialized")
+    save_path, safe_name = await _save_upload(file)
 
     result = await ingest_wf.ainvoke({"file_paths": [save_path]})
     chunks = result.get("chunks", [])
@@ -187,7 +205,7 @@ async def upload_document(file: UploadFile = File(...)):
     total_relations = sum(len(e.relations) for e in extractions)
 
     return IngestResponse(
-        file_name=file.filename or "unknown",
+        file_name=safe_name,
         chunks_count=len(chunks),
         entities_count=total_entities,
         relations_count=total_relations,
@@ -195,17 +213,45 @@ async def upload_document(file: UploadFile = File(...)):
     )
 
 
-@app.post("/api/ingest/batch", response_model=List[IngestResponse], tags=["文档入库"])
-async def upload_batch(files: list[UploadFile] = File(...)):
+@app.post("/api/ingest/batch", response_model=list[IngestResponse], tags=["文档入库"])
+async def upload_batch(files: Annotated[list[UploadFile], File()]):
     """批量上传文档"""
-    results = []
-    for file in files:
-        resp = await upload_document(file)
-        results.append(resp)
-    return results
+    return await asyncio.gather(*(upload_document(file) for file in files))
+
+
+async def _save_upload(file: UploadFile) -> tuple[str, str]:
+    """Persist an upload within the configured directory and enforce a size limit."""
+    safe_name = Path(file.filename or "upload.bin").name
+    if safe_name in {"", ".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid file name")
+    if Path(safe_name).suffix.lower() not in DocParserAgent.SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported document type")
+    upload_root = Path(settings.upload_dir).expanduser().resolve()
+    upload_root.mkdir(parents=True, exist_ok=True)
+    destination = (upload_root / safe_name).resolve()
+    if destination.parent != upload_root:
+        raise HTTPException(status_code=400, detail="Invalid file name")
+    temporary = upload_root / f".{safe_name}.{uuid4().hex}.upload"
+
+    written = 0
+    try:
+        with temporary.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.upload_max_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded file is too large")
+                output.write(chunk)
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    return str(destination), safe_name
 
 
 # ── QA Endpoints ─────────────────────────────────────────────
+
 
 @app.post("/api/qa/ask", response_model=QuestionResponse, tags=["智能问答"])
 async def ask_question(req: QuestionRequest):
@@ -278,7 +324,19 @@ async def _run_deep_research(
     if not deepresearch_wf:
         raise HTTPException(status_code=503, detail="DeepResearch workflow not initialized")
 
-    result = await deepresearch_wf.ainvoke({"question": req.question})
+    try:
+        result = await deepresearch_wf.ainvoke({"question": req.question})
+    except Exception as exc:
+        run_id = trace_store.save_run(
+            workflow=workflow_name,
+            input_payload={"question": req.question},
+            trace=[],
+            output={"question": req.question, "confidence": 0.0, "iterations": 0},
+            status="failed",
+            error=str(exc),
+        )
+        logger.exception("DeepResearch run %s failed", run_id)
+        raise HTTPException(status_code=500, detail=f"DeepResearch failed; run_id={run_id}") from exc
     search_result = result.get("result")
     if not search_result:
         raise HTTPException(status_code=500, detail="DeepResearch failed")
@@ -326,6 +384,8 @@ async def _run_deep_research(
             )
             for item in search_result.evidence
         ],
+        cited_evidence_ids=search_result.cited_evidence_ids,
+        citation_warnings=search_result.citation_warnings,
         sources=[
             {
                 "content": ctx.content[:200],
@@ -357,7 +417,7 @@ async def get_run_trace(run_id: str):
     )
 
 
-@app.get("/api/qa/runs", response_model=List[RunTraceSummaryResponse], tags=["智能问答"])
+@app.get("/api/qa/runs", response_model=list[RunTraceSummaryResponse], tags=["智能问答"])
 async def list_run_traces(
     limit: int = Query(default=20, ge=1, le=200),
     workflow: str | None = Query(default=None),
@@ -371,16 +431,8 @@ async def list_run_traces(
             status=str(row.get("status", "unknown")),
             created_at=str(row.get("created_at", "")),
             question=str(row.get("question", "")),
-            confidence=(
-                float(row.get("confidence"))
-                if row.get("confidence") is not None
-                else None
-            ),
-            iterations=(
-                int(row.get("iterations"))
-                if row.get("iterations") is not None
-                else None
-            ),
+            confidence=(float(row.get("confidence")) if row.get("confidence") is not None else None),
+            iterations=(int(row.get("iterations")) if row.get("iterations") is not None else None),
         )
         for row in rows
     ]
@@ -396,6 +448,7 @@ async def trace_viewer_page():
 
 
 # ── Admin Endpoints ──────────────────────────────────────────
+
 
 @app.get("/api/admin/stats", response_model=StatsResponse, tags=["系统管理"])
 async def get_stats():
@@ -414,7 +467,7 @@ async def trigger_update(req: UpdateRequest):
 
     change = DocumentChange(
         file_path=req.file_path,
-        change_type=ChangeType(req.change_type),
+        change_type=req.change_type,
     )
     result = await update_wf.ainvoke({"changes": [change]})
     results = result.get("results", [])
@@ -435,9 +488,19 @@ async def trigger_update(req: UpdateRequest):
 
 @app.get("/api/health", tags=["系统管理"])
 async def health():
-    return {"status": "ok", "service": "DeepResearch Knowledge Hub"}
+    return {
+        "status": "ok",
+        "service": "DeepResearch Knowledge Hub",
+        "components": {
+            "vector_store": "ready" if vector_store.available else "degraded",
+            "knowledge_graph": "ready" if knowledge_graph.available else "degraded",
+            "web_search": "ready" if web_search.enabled else "disabled",
+            "llm_configured": bool(settings.openai_api_key.strip()),
+        },
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api.main:app", host=settings.api_host, port=settings.api_port, reload=True)

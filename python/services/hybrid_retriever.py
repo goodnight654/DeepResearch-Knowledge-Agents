@@ -11,14 +11,20 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
+import hashlib
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
+from utils.json_utils import coerce_float, parse_json_object
+from utils.openai_clients import create_chat_model
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -75,27 +81,40 @@ class HybridRetriever:
         self.knowledge_graph = knowledge_graph
         self.web_search = web_search
         self.web_page_reader = web_page_reader
-        self.llm = llm or ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_client_base_url,
-            temperature=0,
-        )
+        self.llm = llm or create_chat_model()
 
     async def analyze(self, question: str) -> QueryAnalysis:
+        question = question.strip()
+        if not question:
+            raise ValueError("question must not be empty")
         data = await self._load_json_response(
             QUERY_REWRITE_PROMPT,
             question,
             fallback={"queries": [question], "entities": [], "keywords": []},
         )
-        queries = [q.strip() for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
+        raw_queries = data.get("queries", [])
+        raw_entities = data.get("entities", [])
+        raw_keywords = data.get("keywords", [])
+        queries = (
+            [q.strip() for q in raw_queries if isinstance(q, str) and q.strip()]
+            if isinstance(raw_queries, list)
+            else []
+        )
         if question not in queries:
             queries.insert(0, question)
         return QueryAnalysis(
             question=question,
-            queries=queries[:3],
-            entities=[e for e in data.get("entities", []) if isinstance(e, str) and e.strip()][:6],
-            keywords=[k for k in data.get("keywords", []) if isinstance(k, str) and k.strip()][:10],
+            queries=list(dict.fromkeys(queries))[:3],
+            entities=(
+                list(dict.fromkeys(e.strip() for e in raw_entities if isinstance(e, str) and e.strip()))[:6]
+                if isinstance(raw_entities, list)
+                else []
+            ),
+            keywords=(
+                list(dict.fromkeys(k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()))[:10]
+                if isinstance(raw_keywords, list)
+                else []
+            ),
         )
 
     async def retrieve(
@@ -105,10 +124,24 @@ class HybridRetriever:
         per_query_limit: int = 5,
         web_limit: int | None = None,
     ) -> tuple[QueryAnalysis, list[RetrievedContext]]:
+        top_k = max(1, min(int(top_k), 100))
+        per_query_limit = max(1, min(int(per_query_limit), 50))
         analysis = await self.analyze(question)
-        vector_contexts = await self._vector_retrieve(analysis, per_query_limit)
-        graph_contexts = await self._graph_retrieve(question, analysis, per_query_limit)
-        web_contexts = await self._web_retrieve(analysis, web_limit or min(top_k, settings.web_search_top_k))
+        results = await asyncio.gather(
+            self._vector_retrieve(analysis, per_query_limit),
+            self._graph_retrieve(question, analysis, per_query_limit),
+            self._web_retrieve(analysis, web_limit or min(top_k, settings.web_search_top_k)),
+            return_exceptions=True,
+        )
+        labels = ("vector", "graph", "web")
+        collected: list[list[RetrievedContext]] = []
+        for label, result in zip(labels, results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning("%s retrieval failed: %s", label, result)
+                collected.append([])
+            else:
+                collected.append(result)
+        vector_contexts, graph_contexts, web_contexts = collected
         contexts = self._hybrid_rerank(vector_contexts + graph_contexts + web_contexts)
         return analysis, contexts[:top_k]
 
@@ -122,16 +155,28 @@ class HybridRetriever:
 
         contexts: list[RetrievedContext] = []
         for query in analysis.queries:
-            results = await self.vector_store.search(query, top_k=per_query_limit)
+            try:
+                results = await self.vector_store.search(query, top_k=per_query_limit)
+            except Exception as exc:
+                logger.warning("vector query failed for %r: %s", query, exc)
+                continue
             for doc, score in results:
+                if not isinstance(doc, dict):
+                    continue
+                content = str(doc.get("content", "") or "").strip()
+                if not content:
+                    continue
+                metadata = doc.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
                 contexts.append(
                     RetrievedContext(
-                        content=doc.get("content", ""),
-                        source=doc.get("source", "vector_store"),
-                        score=score,
+                        content=content,
+                        source=str(doc.get("source", "vector_store") or "vector_store"),
+                        score=coerce_float(score),
                         retrieval_type="vector",
                         metadata={
-                            **doc.get("metadata", {}),
+                            **metadata,
                             "query": query,
                         },
                     )
@@ -150,8 +195,15 @@ class HybridRetriever:
         contexts: list[RetrievedContext] = []
 
         for entity in analysis.entities[:3]:
-            entity_hits = await self.knowledge_graph.search_entities(entity, limit=3)
+            try:
+                entity_hits = await self.knowledge_graph.search_entities(entity, limit=3)
+                neighbors = await self.knowledge_graph.get_neighbors(entity, hops=2)
+            except Exception as exc:
+                logger.warning("graph lookup failed for %r: %s", entity, exc)
+                continue
             for hit in entity_hits:
+                if not isinstance(hit, dict):
+                    continue
                 contexts.append(
                     RetrievedContext(
                         content=(
@@ -165,8 +217,9 @@ class HybridRetriever:
                     )
                 )
 
-            neighbors = await self.knowledge_graph.get_neighbors(entity, hops=2)
             for record in neighbors[:per_query_limit]:
+                if not isinstance(record, dict):
+                    continue
                 contexts.append(
                     RetrievedContext(
                         content=(
@@ -186,8 +239,11 @@ class HybridRetriever:
             f"问题: {question}\n实体: {analysis.entities}",
             fallback={"queries": []},
         )
-        for cypher in cypher_data.get("queries", [])[:2]:
-            if not isinstance(cypher, str) or not cypher.strip():
+        raw_cypher_queries = cypher_data.get("queries", [])
+        if not isinstance(raw_cypher_queries, list):
+            raw_cypher_queries = []
+        for cypher in raw_cypher_queries[:2]:
+            if not isinstance(cypher, str) or not self._is_read_only_cypher(cypher):
                 continue
             try:
                 records = await self.knowledge_graph.execute_cypher(cypher)
@@ -216,31 +272,42 @@ class HybridRetriever:
 
         queries = analysis.queries[:2] or [analysis.question]
         contexts: list[RetrievedContext] = []
-        for query in queries:
-            try:
-                results = await self.web_search.search(query, top_k=top_k)
-            except Exception:
+        search_batches = await asyncio.gather(
+            *(self.web_search.search(query, top_k=top_k) for query in queries),
+            return_exceptions=True,
+        )
+        items_with_queries: list[tuple[Any, str]] = []
+        for query, batch in zip(queries, search_batches, strict=False):
+            if isinstance(batch, Exception):
                 continue
-            for item in results:
-                page_contexts = await self._read_web_page(item, query)
-                if page_contexts:
-                    contexts.extend(page_contexts)
-                    continue
+            items_with_queries.extend((item, query) for item in batch)
 
-                contexts.append(
-                    RetrievedContext(
-                        content=f"{item.title}\n{item.snippet}",
-                        source=item.url or item.provider,
-                        score=float(item.score),
-                        retrieval_type="web",
-                        metadata={
-                            "query": query,
-                            "provider": item.provider,
-                            "title": item.title,
-                            "url": item.url,
-                        },
-                    )
+        page_batches = await asyncio.gather(
+            *(self._read_web_page(item, query) for item, query in items_with_queries),
+            return_exceptions=True,
+        )
+        for (item, query), page_batch in zip(items_with_queries, page_batches, strict=False):
+            if not getattr(item, "title", "") and not getattr(item, "snippet", ""):
+                continue
+            page_contexts = [] if isinstance(page_batch, Exception) else page_batch
+            if page_contexts:
+                contexts.extend(page_contexts)
+                continue
+
+            contexts.append(
+                RetrievedContext(
+                    content=f"{item.title}\n{item.snippet}".strip(),
+                    source=item.url or item.provider,
+                    score=coerce_float(item.score),
+                    retrieval_type="web",
+                    metadata={
+                        "query": query,
+                        "provider": item.provider,
+                        "title": item.title,
+                        "url": item.url,
+                    },
                 )
+            )
         return contexts
 
     async def _read_web_page(self, item: Any, query: str) -> list[RetrievedContext]:
@@ -250,7 +317,7 @@ class HybridRetriever:
             chunks = await self.web_page_reader.read(
                 url=item.url,
                 title=item.title,
-                score=float(item.score),
+                score=coerce_float(item.score),
             )
         except Exception:
             return []
@@ -261,7 +328,7 @@ class HybridRetriever:
                 RetrievedContext(
                     content=chunk.content,
                     source=chunk.url,
-                    score=float(item.score),
+                    score=coerce_float(item.score),
                     retrieval_type="web_page",
                     metadata={
                         "query": query,
@@ -291,27 +358,41 @@ class HybridRetriever:
         except Exception:
             return fallback
 
-        cleaned = str(resp.content).strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
+        return parse_json_object(resp.content) or fallback
 
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            return fallback
-        return data if isinstance(data, dict) else fallback
+    @staticmethod
+    def _is_read_only_cypher(cypher: str) -> bool:
+        """Allow model-generated read queries while rejecting mutating Cypher."""
+        cleaned = re.sub(r"//.*?$|/\*.*?\*/", " ", cypher, flags=re.MULTILINE | re.DOTALL).strip()
+        if not re.match(r"^(MATCH|OPTIONAL\s+MATCH)\b", cleaned, flags=re.IGNORECASE):
+            return False
+        forbidden = r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|CALL|LOAD\s+CSV|FOREACH)\b"
+        return re.search(forbidden, cleaned, flags=re.IGNORECASE) is None
 
     @staticmethod
     def _hybrid_rerank(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
         weight_map = {"vector": 1.0, "graph": 1.2, "web": 1.05, "web_page": 1.15, "hybrid": 1.1}
-        deduped: dict[tuple[str, str], RetrievedContext] = {}
+        deduped: dict[str, RetrievedContext] = {}
 
         for ctx in contexts:
-            ctx.score *= weight_map.get(ctx.retrieval_type, 1.0)
-            key = (ctx.source, ctx.content[:160])
+            content = " ".join(str(ctx.content or "").split()).strip()
+            if not content:
+                continue
+            source = str(ctx.source or ctx.metadata.get("url") or "unknown").strip()
+            weighted_score = coerce_float(ctx.score) * weight_map.get(ctx.retrieval_type, 1.0)
+            ranked = RetrievedContext(
+                content=content,
+                source=source,
+                score=min(max(weighted_score, 0.0), 1.0),
+                retrieval_type=ctx.retrieval_type,
+                metadata=dict(ctx.metadata),
+            )
+            canonical_url = str(ranked.metadata.get("url", "")).split("#", 1)[0].rstrip("/")
+            identity = f"{canonical_url or source}\0{content.casefold()}"
+            key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             existing = deduped.get(key)
-            if existing is None or ctx.score > existing.score:
-                deduped[key] = ctx
+            if existing is None or ranked.score > existing.score:
+                deduped[key] = ranked
 
         ordered = list(deduped.values())
         ordered.sort(key=lambda item: item.score, reverse=True)

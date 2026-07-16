@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -30,6 +30,7 @@ from agents.knowledge_update_agent import (
 from agents.qa_agent import QAAgent, QAResult
 from services.knowledge_graph import KnowledgeGraphService
 from services.vector_store import VectorStoreService
+from utils.json_utils import coerce_float
 
 
 class WorkflowType(str, Enum):
@@ -42,8 +43,10 @@ class WorkflowType(str, Enum):
 
 # ── State Schemas ────────────────────────────────────────────
 
-class IngestState(dict):
+
+class IngestState(TypedDict, total=False):
     """文档入库流程状态"""
+
     file_paths: list[str]
     chunks: list[DocumentChunk]
     extractions: list[ExtractionResult]
@@ -52,17 +55,32 @@ class IngestState(dict):
     messages: Annotated[list, add_messages]
 
 
-class QAState(dict):
+class QAState(TypedDict, total=False):
     """问答流程状态"""
+
     question: str
     result: QAResult | None
     messages: Annotated[list, add_messages]
 
 
-class DeepResearchState(dict):
+class DeepResearchState(TypedDict, total=False):
     """DeepResearch 流程状态"""
+
     question: str
     result: DeepResearchResult | None
+    plan: dict[str, Any]
+    focus: str
+    frontier: list[str]
+    attempted_queries: list[str]
+    iteration: int
+    current_queries: list[str]
+    current_round_contexts: list[Any]
+    current_summary: str
+    all_contexts: list[Any]
+    steps: list[Any]
+    confidence: float
+    should_finalize: bool
+    trace: list[dict[str, Any]]
     messages: Annotated[list, add_messages]
 
 
@@ -70,14 +88,16 @@ class DeepSearchState(DeepResearchState):
     """Backward-compatible DeepSearch state alias."""
 
 
-class UpdateState(dict):
+class UpdateState(TypedDict, total=False):
     """增量更新流程状态"""
+
     changes: list[DocumentChange]
     results: list[UpdateResult]
     messages: Annotated[list, add_messages]
 
 
 # ── Workflow Builder ─────────────────────────────────────────
+
 
 def build_knowledge_graph_workflow(
     vector_store: VectorStoreService | None = None,
@@ -120,6 +140,7 @@ def build_knowledge_graph_workflow(
 
 # ── Ingest Pipeline ─────────────────────────────────────────
 
+
 def _build_ingest_graph(
     doc_parser: DocParserAgent,
     extractor: KnowledgeExtractAgent,
@@ -146,17 +167,20 @@ def _build_ingest_graph(
 
     async def store_graph(state: dict) -> dict:
         extractions = state.get("extractions", [])
+        chunks = state.get("chunks", [])
+        source_by_chunk = {chunk.chunk_id: str(chunk.metadata.get("source", "")) for chunk in chunks}
         entity_count = 0
         if knowledge_graph:
             for ext in extractions:
+                source = source_by_chunk.get(ext.source_chunk_id, "")
                 for ent in ext.entities:
-                    await knowledge_graph.upsert_entity(ent)
+                    await knowledge_graph.upsert_entity(ent, source=source)
                     entity_count += 1
                 for rel in ext.relations:
-                    await knowledge_graph.add_relation(rel)
+                    await knowledge_graph.add_relation(rel, source=source)
         return {"entities_stored": entity_count}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(IngestState)
     graph.add_node("parse", parse_documents)
     graph.add_node("extract", extract_knowledge)
     graph.add_node("store_vectors", store_vectors)
@@ -174,6 +198,7 @@ def _build_ingest_graph(
 
 # ── QA Pipeline ──────────────────────────────────────────────
 
+
 def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
 
     async def process_question(state: dict) -> dict:
@@ -181,7 +206,7 @@ def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
         result = await qa_agent.answer(question)
         return {"result": result}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(QAState)
     graph.add_node("answer", process_question)
     graph.set_entry_point("answer")
     graph.add_edge("answer", END)
@@ -190,6 +215,7 @@ def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
 
 
 # ── DeepResearch Pipeline ───────────────────────────────────
+
 
 def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGraph:
     def _trace_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -200,7 +226,7 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
         }
 
     async def plan_search(state: dict) -> dict:
-        question = state.get("question", "")
+        question = deepresearch_agent.normalize_question(state.get("question", ""))
         plan = await deepresearch_agent.plan_search(question)
         focus = str(plan.get("goal") or question)
         frontier = deepresearch_agent.initial_frontier(plan, question)
@@ -221,6 +247,7 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
             "iteration": 0,
             "all_contexts": [],
             "steps": [],
+            "attempted_queries": [],
             "confidence": 0.0,
             "trace": trace,
         }
@@ -229,7 +256,8 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
         question = state.get("question", "")
         iteration = int(state.get("iteration", 0)) + 1
         frontier = state.get("frontier", []) or [question]
-        queries = frontier[: deepresearch_agent.queries_per_iteration] or [question]
+        attempted = {str(query).casefold() for query in state.get("attempted_queries", [])}
+        queries = deepresearch_agent.select_queries(frontier, attempted, fallback=question)
         round_contexts = await deepresearch_agent.retrieve_round(queries)
         all_contexts = deepresearch_agent.merge_contexts(state.get("all_contexts", []) + round_contexts)
         trace = state.get("trace", []) + [
@@ -248,6 +276,7 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
             "current_queries": queries,
             "current_round_contexts": round_contexts,
             "all_contexts": all_contexts,
+            "attempted_queries": state.get("attempted_queries", []) + queries,
             "trace": trace,
         }
 
@@ -283,7 +312,11 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
             summary=summary,
             contexts=all_contexts,
         )
-        follow_up = deepresearch_agent.clean_list(gap_state.get("follow_up_queries"))
+        attempted = {str(query).casefold() for query in state.get("attempted_queries", [])}
+        follow_up = deepresearch_agent.select_queries(
+            deepresearch_agent.clean_list(gap_state.get("follow_up_queries")),
+            attempted,
+        )
         should_finalize = deepresearch_agent.should_finalize(
             iteration=int(state.get("iteration", 0)),
             gap_state=gap_state,
@@ -300,7 +333,10 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
         )
         updated_steps = steps + [step]
         next_focus = str(gap_state.get("next_focus") or focus)
-        confidence = float(gap_state.get("confidence", state.get("confidence", 0.0)))
+        confidence = min(
+            max(coerce_float(gap_state.get("confidence"), state.get("confidence", 0.0)), 0.0),
+            1.0,
+        )
         trace = state.get("trace", []) + [
             _trace_event(
                 "assess_gap",
@@ -334,10 +370,16 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
         question = state.get("question", "")
         plan = state.get("plan", {})
         steps = state.get("steps", [])
-        contexts = deepresearch_agent.merge_contexts(state.get("all_contexts", []))[: deepresearch_agent.final_context_limit]
+        contexts = deepresearch_agent.select_final_contexts(state.get("all_contexts", []))
         evidence = deepresearch_agent.build_evidence(contexts)
 
-        executive_summary, answer, confidence = await deepresearch_agent.compose_answer(
+        (
+            executive_summary,
+            answer,
+            confidence,
+            cited_ids,
+            citation_warnings,
+        ) = await deepresearch_agent.compose_answer(
             question=question,
             plan=plan,
             steps=steps,
@@ -353,6 +395,8 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
             steps=steps,
             evidence=evidence,
             confidence=confidence,
+            cited_evidence_ids=cited_ids,
+            citation_warnings=citation_warnings,
         )
         trace = state.get("trace", []) + [
             _trace_event(
@@ -360,13 +404,16 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
                 {
                     "iterations": len(steps),
                     "contexts_count": len(contexts),
+                    "evidence_count": len(evidence),
+                    "cited_evidence_ids": cited_ids,
+                    "citation_warnings": citation_warnings,
                     "confidence": confidence,
                 },
             )
         ]
         return {"result": result, "trace": trace}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(DeepResearchState)
     graph.add_node("plan_search", plan_search)
     graph.add_node("retrieve_round", retrieve_round)
     graph.add_node("summarize_round", summarize_round)
@@ -389,6 +436,7 @@ def _build_deepresearch_graph(deepresearch_agent: DeepResearchAgent) -> StateGra
 
 # ── Update Pipeline ──────────────────────────────────────────
 
+
 def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
 
     async def process_updates(state: dict) -> dict:
@@ -410,7 +458,7 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
         all_results = [r for r in results if r.success] + retried
         return {"results": all_results}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(UpdateState)
     graph.add_node("process", process_updates)
     graph.add_node("retry", retry_failed)
 

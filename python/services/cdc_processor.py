@@ -24,14 +24,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from config import settings
+from utils.json_utils import coerce_float
 
 
 @dataclass
 class CDCEvent:
     """统一的 CDC 事件格式"""
+
     event_id: str
     source_type: str  # "filesystem" | "database" | "api"
-    operation: str    # "INSERT" | "UPDATE" | "DELETE"
+    operation: str  # "INSERT" | "UPDATE" | "DELETE"
     resource_path: str
     timestamp: float = field(default_factory=time.time)
     before: dict[str, Any] | None = None
@@ -69,7 +71,9 @@ class CDCProcessor:
     # ── Event Normalization ──────────────────────────────────
 
     @staticmethod
-    def from_filesystem_event(event_type: str, file_path: str, content_before: str = "", content_after: str = "") -> CDCEvent:
+    def from_filesystem_event(
+        event_type: str, file_path: str, content_before: str = "", content_after: str = ""
+    ) -> CDCEvent:
         """从文件系统事件创建 CDCEvent"""
         op_map = {"created": "INSERT", "modified": "UPDATE", "deleted": "DELETE"}
         return CDCEvent(
@@ -84,15 +88,27 @@ class CDCProcessor:
     @staticmethod
     def from_kafka_message(message: bytes) -> CDCEvent:
         """从 Kafka CDC 消息创建 CDCEvent (Debezium 格式)"""
-        payload = json.loads(message)
+        decoded = json.loads(message)
+        if not isinstance(decoded, dict):
+            raise ValueError("CDC message must be a JSON object")
+        payload = decoded.get("payload", decoded)
+        if not isinstance(payload, dict):
+            raise ValueError("CDC payload must be a JSON object")
+        raw_operation = str(payload.get("op", "u")).casefold()
+        operation = {"c": "INSERT", "r": "INSERT", "u": "UPDATE", "d": "DELETE"}.get(
+            raw_operation,
+            raw_operation.upper(),
+        )
+        source = payload.get("source", {})
+        source = source if isinstance(source, dict) else {}
         return CDCEvent(
             event_id=payload.get("id", hashlib.sha256(message).hexdigest()[:16]),
             source_type="database",
-            operation=payload.get("op", "UPDATE").upper(),
-            resource_path=payload.get("source", {}).get("table", "unknown"),
+            operation=operation,
+            resource_path=str(source.get("table", "unknown")),
             before=payload.get("before"),
             after=payload.get("after"),
-            timestamp=payload.get("ts_ms", time.time() * 1000) / 1000,
+            timestamp=coerce_float(payload.get("ts_ms"), time.time() * 1000) / 1000,
         )
 
     # ── Diff Computation ─────────────────────────────────────
